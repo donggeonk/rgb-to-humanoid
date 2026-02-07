@@ -1,6 +1,6 @@
-demo.mp4
 output
 yolov8n.pt
 *.pth
 __pycache__
 webcam_output
+*.mp4

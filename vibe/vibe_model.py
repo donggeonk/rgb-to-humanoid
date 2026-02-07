@@ -17,15 +17,16 @@ import torchvision.models as models
 import numpy as np
 
 SPIN_URL = (
-    'https://openmmlab-share.oss-cn-hangzhou.aliyuncs.com/mmhuman3d/models/'
-    'vibe/spin.pth?versionId=CAEQKhiBgMD9hdub9xciIDIxMGI4NmMxMGIy'
-    'NzQxOGM5YzYxZjMyYTVmMjllOTAy'
+    "https://openmmlab-share.oss-cn-hangzhou.aliyuncs.com/mmhuman3d/models/"
+    "vibe/spin.pth?versionId=CAEQKhiBgMD9hdub9xciIDIxMGI4NmMxMGIy"
+    "NzQxOGM5YzYxZjMyYTVmMjllOTAy"
 )
 
 
 # ============================================================
 # Rotation Utilities
 # ============================================================
+
 
 def rot6d_to_rotmat(x):
     """Convert 6D rotation representation to 3x3 rotation matrices.
@@ -50,11 +51,14 @@ def rotmat_to_angle_axis(R):
     cos_angle = ((trace - 1.0) / 2.0).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
     angle = torch.acos(cos_angle)
 
-    r = torch.stack([
-        R[:, 2, 1] - R[:, 1, 2],
-        R[:, 0, 2] - R[:, 2, 0],
-        R[:, 1, 0] - R[:, 0, 1],
-    ], dim=-1)
+    r = torch.stack(
+        [
+            R[:, 2, 1] - R[:, 1, 2],
+            R[:, 0, 2] - R[:, 2, 0],
+            R[:, 1, 0] - R[:, 0, 1],
+        ],
+        dim=-1,
+    )
 
     sin_angle = torch.sin(angle)
     axis = r / (2.0 * sin_angle.unsqueeze(-1) + 1e-8)
@@ -70,18 +74,19 @@ def rotmat_to_angle_axis(R):
 # Minimal SMPL Layer (Linear Blend Skinning)
 # ============================================================
 
+
 class SMPLLayer(nn.Module):
     """Minimal SMPL forward pass. Parameters loaded from mmhuman3d checkpoint."""
 
     def __init__(self):
         super().__init__()
-        self.register_buffer('v_template', torch.zeros(6890, 3))
-        self.register_buffer('shapedirs', torch.zeros(6890, 3, 10))
-        self.register_buffer('posedirs', torch.zeros(207, 20670))
-        self.register_buffer('J_regressor', torch.zeros(24, 6890))
-        self.register_buffer('lbs_weights', torch.zeros(6890, 24))
-        self.register_buffer('parents', torch.zeros(24, dtype=torch.long))
-        self.register_buffer('faces', torch.zeros(13776, 3, dtype=torch.long))
+        self.register_buffer("v_template", torch.zeros(6890, 3))
+        self.register_buffer("shapedirs", torch.zeros(6890, 3, 10))
+        self.register_buffer("posedirs", torch.zeros(207, 20670))
+        self.register_buffer("J_regressor", torch.zeros(24, 6890))
+        self.register_buffer("lbs_weights", torch.zeros(6890, 24))
+        self.register_buffer("parents", torch.zeros(24, dtype=torch.long))
+        self.register_buffer("faces", torch.zeros(13776, 3, dtype=torch.long))
 
     def forward(self, rotmats, betas):
         """
@@ -97,16 +102,16 @@ class SMPLLayer(nn.Module):
 
         # 1. Shape blend shapes
         v_shaped = self.v_template.unsqueeze(0) + torch.einsum(
-            'vci,bi->bvc', self.shapedirs, betas)
+            "vci,bi->bvc", self.shapedirs, betas
+        )
 
         # 2. Joint locations
-        J = torch.einsum('jv,bvc->bjc', self.J_regressor, v_shaped)
+        J = torch.einsum("jv,bvc->bjc", self.J_regressor, v_shaped)
 
         # 3. Pose blend shapes (exclude root joint)
         ident = torch.eye(3, device=device).unsqueeze(0).unsqueeze(0)
         pose_feature = (rotmats[:, 1:] - ident).reshape(B, -1)  # (B, 207)
-        pose_offsets = torch.matmul(
-            pose_feature, self.posedirs).reshape(B, 6890, 3)
+        pose_offsets = torch.matmul(pose_feature, self.posedirs).reshape(B, 6890, 3)
         v_posed = v_shaped + pose_offsets
 
         # 4. Forward kinematics
@@ -128,8 +133,9 @@ class SMPLLayer(nn.Module):
         rel_joints[:, 1:] -= joints[:, self.parents[1:]]
 
         # Local transforms [R | t; 0 | 1]
-        transforms = torch.zeros(B, 24, 4, 4,
-                                 device=rot_mats.device, dtype=rot_mats.dtype)
+        transforms = torch.zeros(
+            B, 24, 4, 4, device=rot_mats.device, dtype=rot_mats.dtype
+        )
         transforms[:, :, :3, :3] = rot_mats
         transforms[:, :, :3, 3] = rel_joints
         transforms[:, :, 3, 3] = 1.0
@@ -144,8 +150,7 @@ class SMPLLayer(nn.Module):
 
         # Compute skinning transforms (subtract rest-pose joint offset)
         joints_homo = F.pad(joints.unsqueeze(-1), [0, 0, 0, 1])  # (B,24,4,1)
-        init_bone = F.pad(
-            torch.matmul(global_tf, joints_homo), [3, 0])  # (B,24,4,4)
+        init_bone = F.pad(torch.matmul(global_tf, joints_homo), [3, 0])  # (B,24,4,4)
         A = global_tf - init_bone
 
         return posed_joints, A
@@ -154,6 +159,7 @@ class SMPLLayer(nn.Module):
 # ============================================================
 # Backbone: ResNet50 Feature Extractor
 # ============================================================
+
 
 class ResNet50Backbone(nn.Module):
     """ResNet50 backbone outputting 2048-dim features per image.
@@ -178,14 +184,17 @@ class ResNet50Backbone(nn.Module):
         backbone_keys = {}
         for k, v in spin_state_dict.items():
             # Only load backbone params (conv1, bn1, layer1-4)
-            if k.startswith(('conv1.', 'bn1.', 'layer1.', 'layer2.',
-                             'layer3.', 'layer4.')):
+            if k.startswith(
+                ("conv1.", "bn1.", "layer1.", "layer2.", "layer3.", "layer4.")
+            ):
                 backbone_keys[k] = v
         missing, unexpected = self.load_state_dict(backbone_keys, strict=False)
         # avgpool has no learnable params, so missing keys for it are fine
         loaded = len(backbone_keys) - len(unexpected)
-        print(f"[Backbone] Loaded {loaded} SPIN params "
-              f"(skipped {len(missing)} non-backbone keys)")
+        print(
+            f"[Backbone] Loaded {loaded} SPIN params "
+            f"(skipped {len(missing)} non-backbone keys)"
+        )
 
     def forward(self, x):
         """x: (B, 3, 224, 224) → (B, 2048)"""
@@ -198,6 +207,7 @@ class ResNet50Backbone(nn.Module):
 # Temporal GRU Encoder (neck)
 # ============================================================
 
+
 class TemporalGRUEncoder(nn.Module):
     """Bidirectional=False GRU with linear projection and residual connection."""
 
@@ -205,24 +215,29 @@ class TemporalGRUEncoder(nn.Module):
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
-        self.gru = nn.GRU(input_size=input_size, hidden_size=hidden_size,
-                          num_layers=num_layers, bidirectional=False)
+        self.gru = nn.GRU(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            bidirectional=False,
+        )
         self.relu = nn.ReLU()
         self.linear = nn.Linear(hidden_size, input_size)
 
     def forward(self, x):
         """x: (B, T, 2048) → (B, T, 2048)"""
         N, T = x.shape[:2]
-        x = x.permute(1, 0, 2)                           # (T, N, F)
+        x = x.permute(1, 0, 2)  # (T, N, F)
         y, _ = self.gru(x)
         y = self.linear(self.relu(y).reshape(-1, self.hidden_size))
-        y = y.reshape(T, N, self.input_size) + x          # residual
-        return y.permute(1, 0, 2).contiguous()             # (N, T, F)
+        y = y.reshape(T, N, self.input_size) + x  # residual
+        return y.permute(1, 0, 2).contiguous()  # (N, T, F)
 
 
 # ============================================================
 # HMR Regression Head
 # ============================================================
+
 
 class HMRHead(nn.Module):
     """Iterative SMPL parameter regressor (3 iterations)."""
@@ -241,9 +256,9 @@ class HMRHead(nn.Module):
         nn.init.xavier_uniform_(self.decshape.weight, gain=0.01)
         nn.init.xavier_uniform_(self.deccam.weight, gain=0.01)
 
-        self.register_buffer('init_pose', torch.zeros(1, npose))
-        self.register_buffer('init_shape', torch.zeros(1, nbeta))
-        self.register_buffer('init_cam', torch.FloatTensor([[1, 0, 0]]))
+        self.register_buffer("init_pose", torch.zeros(1, npose))
+        self.register_buffer("init_shape", torch.zeros(1, nbeta))
+        self.register_buffer("init_cam", torch.FloatTensor([[1, 0, 0]]))
 
     def forward(self, x, n_iter=3):
         """x: (B, T, 2048) or (B, 2048). Returns dict of predictions."""
@@ -274,9 +289,9 @@ class HMRHead(nn.Module):
             pred_cam = pred_cam.reshape(B, T, 3)
 
         return {
-            'pred_rotmat': pred_rotmat,
-            'pred_shape': pred_shape,
-            'pred_cam': pred_cam,
+            "pred_rotmat": pred_rotmat,
+            "pred_shape": pred_shape,
+            "pred_cam": pred_cam,
         }
 
 
@@ -286,18 +301,56 @@ class HMRHead(nn.Module):
 
 # SMPL skeleton connectivity for visualization
 SMPL_SKELETON = [
-    (0, 1), (0, 2), (0, 3), (1, 4), (2, 5), (3, 6),
-    (4, 7), (5, 8), (6, 9), (7, 10), (8, 11),
-    (9, 12), (9, 13), (9, 14), (12, 15),
-    (13, 16), (14, 17), (16, 18), (17, 19),
-    (18, 20), (19, 21), (20, 22), (21, 23),
+    (0, 1),
+    (0, 2),
+    (0, 3),
+    (1, 4),
+    (2, 5),
+    (3, 6),
+    (4, 7),
+    (5, 8),
+    (6, 9),
+    (7, 10),
+    (8, 11),
+    (9, 12),
+    (9, 13),
+    (9, 14),
+    (12, 15),
+    (13, 16),
+    (14, 17),
+    (16, 18),
+    (17, 19),
+    (18, 20),
+    (19, 21),
+    (20, 22),
+    (21, 23),
 ]
 
 SMPL_JOINT_NAMES = [
-    'Pelvis', 'L_Hip', 'R_Hip', 'Spine1', 'L_Knee', 'R_Knee',
-    'Spine2', 'L_Ankle', 'R_Ankle', 'Spine3', 'L_Foot', 'R_Foot',
-    'Neck', 'L_Collar', 'R_Collar', 'Head', 'L_Shoulder', 'R_Shoulder',
-    'L_Elbow', 'R_Elbow', 'L_Wrist', 'R_Wrist', 'L_Hand', 'R_Hand',
+    "Pelvis",
+    "L_Hip",
+    "R_Hip",
+    "Spine1",
+    "L_Knee",
+    "R_Knee",
+    "Spine2",
+    "L_Ankle",
+    "R_Ankle",
+    "Spine3",
+    "L_Foot",
+    "R_Foot",
+    "Neck",
+    "L_Collar",
+    "R_Collar",
+    "Head",
+    "L_Shoulder",
+    "R_Shoulder",
+    "L_Elbow",
+    "R_Elbow",
+    "L_Wrist",
+    "R_Wrist",
+    "L_Hand",
+    "R_Hand",
 ]
 
 
@@ -317,12 +370,13 @@ class VIBE(nn.Module):
         super().__init__()
         self.backbone = ResNet50Backbone()
         self.temporal_encoder = TemporalGRUEncoder(
-            input_size=2048, num_layers=2, hidden_size=1024)
+            input_size=2048, num_layers=2, hidden_size=1024
+        )
         self.hmr_head = HMRHead(feat_dim=2048)
         self.smpl = SMPLLayer()
 
     @classmethod
-    def from_pretrained(cls, checkpoint_path, spin_path=None, device='cpu'):
+    def from_pretrained(cls, checkpoint_path, spin_path=None, device="cpu"):
         """Load model from mmhuman3d checkpoint + SPIN backbone.
 
         Args:
@@ -331,39 +385,36 @@ class VIBE(nn.Module):
             device: target device
         """
         model = cls()
-        ckpt = torch.load(checkpoint_path, map_location='cpu',
-                          weights_only=False)
-        sd = ckpt['state_dict']
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        sd = ckpt["state_dict"]
 
         # --- Load SPIN backbone ---
         if spin_path is None:
-            spin_path = os.path.join(os.path.dirname(checkpoint_path),
-                                     'spin.pth')
+            spin_path = os.path.join(os.path.dirname(checkpoint_path), "spin.pth")
         if not os.path.exists(spin_path):
             print(f"[VIBE] Downloading SPIN backbone → {spin_path}")
             torch.hub.download_url_to_file(SPIN_URL, spin_path)
-        spin_ckpt = torch.load(spin_path, map_location='cpu',
-                               weights_only=False)
-        spin_sd = spin_ckpt['state_dict']
+        spin_ckpt = torch.load(spin_path, map_location="cpu", weights_only=False)
+        spin_sd = spin_ckpt["state_dict"]
         model.backbone.load_spin_weights(spin_sd)
 
         # --- Load temporal encoder (neck.*) ---
-        neck_sd = {k[5:]: v for k, v in sd.items() if k.startswith('neck.')}
+        neck_sd = {k[5:]: v for k, v in sd.items() if k.startswith("neck.")}
         model.temporal_encoder.load_state_dict(neck_sd)
 
         # --- Load HMR head (head.*) ---
-        head_sd = {k[5:]: v for k, v in sd.items() if k.startswith('head.')}
+        head_sd = {k[5:]: v for k, v in sd.items() if k.startswith("head.")}
         model.hmr_head.load_state_dict(head_sd)
 
         # --- Load SMPL body model (body_model_test.*) ---
-        prefix = 'body_model_test.'
-        model.smpl.v_template.copy_(sd[f'{prefix}v_template'])
-        model.smpl.shapedirs.copy_(sd[f'{prefix}shapedirs'])
-        model.smpl.posedirs.copy_(sd[f'{prefix}posedirs'])
-        model.smpl.J_regressor.copy_(sd[f'{prefix}J_regressor'])
-        model.smpl.lbs_weights.copy_(sd[f'{prefix}lbs_weights'])
-        model.smpl.parents.copy_(sd[f'{prefix}parents'].long())
-        model.smpl.faces.copy_(sd[f'{prefix}faces_tensor'].long())
+        prefix = "body_model_test."
+        model.smpl.v_template.copy_(sd[f"{prefix}v_template"])
+        model.smpl.shapedirs.copy_(sd[f"{prefix}shapedirs"])
+        model.smpl.posedirs.copy_(sd[f"{prefix}posedirs"])
+        model.smpl.J_regressor.copy_(sd[f"{prefix}J_regressor"])
+        model.smpl.lbs_weights.copy_(sd[f"{prefix}lbs_weights"])
+        model.smpl.parents.copy_(sd[f"{prefix}parents"].long())
+        model.smpl.faces.copy_(sd[f"{prefix}faces_tensor"].long())
 
         model = model.to(device).eval()
         print(f"[VIBE] Loaded checkpoint from {checkpoint_path}")
@@ -404,15 +455,15 @@ class VIBE(nn.Module):
         output = self.hmr_head(features)
 
         if run_smpl:
-            rotmats = output['pred_rotmat'].reshape(B * T, 24, 3, 3)
-            betas = output['pred_shape'].reshape(B * T, 10)
+            rotmats = output["pred_rotmat"].reshape(B * T, 24, 3, 3)
+            betas = output["pred_shape"].reshape(B * T, 10)
             verts, joints = self.smpl(rotmats, betas)
-            output['vertices'] = verts.reshape(B, T, 6890, 3)
-            output['joints'] = joints.reshape(B, T, 24, 3)
+            output["vertices"] = verts.reshape(B, T, 6890, 3)
+            output["joints"] = joints.reshape(B, T, 24, 3)
 
             # Also provide axis-angle representation
             aa = rotmat_to_angle_axis(rotmats.reshape(-1, 3, 3))
-            output['pose_axis_angle'] = aa.reshape(B, T, 24, 3)
+            output["pose_axis_angle"] = aa.reshape(B, T, 24, 3)
 
         return output
 
@@ -449,7 +500,8 @@ def preprocess_image(img_bgr, bbox=None, target_size=224):
         pad_b = max(0, y2c - h)
         if pad_l or pad_t or pad_r or pad_b:
             img_bgr = cv2.copyMakeBorder(
-                img_bgr, pad_t, pad_b, pad_l, pad_r, cv2.BORDER_CONSTANT)
+                img_bgr, pad_t, pad_b, pad_l, pad_r, cv2.BORDER_CONSTANT
+            )
             x1c += pad_l
             y1c += pad_t
             x2c += pad_l
@@ -461,7 +513,7 @@ def preprocess_image(img_bgr, bbox=None, target_size=224):
         size = min(h, w)
         y1c = (h - size) // 2
         x1c = (w - size) // 2
-        crop = img_bgr[y1c:y1c + size, x1c:x1c + size]
+        crop = img_bgr[y1c : y1c + size, x1c : x1c + size]
 
     crop = cv2.resize(crop, (target_size, target_size))
     # BGR → RGB → float → normalize
@@ -503,11 +555,12 @@ def detect_persons(frame_bgr, detector=None):
         return [[0, 0, w, h, 1.0]]
 
 
-def load_detector(device='cpu'):
+def load_detector(device="cpu"):
     """Try to load YOLOv8 person detector."""
     try:
         from ultralytics import YOLO
-        detector = YOLO('yolov8n.pt')
+
+        detector = YOLO("yolov8n.pt")
         detector.to(device)
         print("[Detector] YOLOv8n loaded")
         return detector
