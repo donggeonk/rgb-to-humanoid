@@ -23,9 +23,10 @@ import numpy as np
 import torch
 
 from vibe_model import (
-    VIBE, SMPL_SKELETON, SMPL_JOINT_NAMES,
-    preprocess_image, project_joints_2d, detect_persons, load_detector,
+    VIBE, SMPL_JOINT_NAMES,
+    preprocess_image, project_joints_2d, load_detector,
 )
+from demo_utils import draw_skeleton, detect_best_person, crop_to_image_coords
 
 
 def extract_frames(video_path):
@@ -43,18 +44,6 @@ def extract_frames(video_path):
     cap.release()
     print(f"[Video] Loaded {len(frames)} frames at {fps:.1f} FPS")
     return frames, fps
-
-
-def draw_skeleton(img, joints_2d, color=(0, 255, 0), thickness=2):
-    """Draw SMPL skeleton on an image."""
-    for i, j in SMPL_SKELETON:
-        pt1 = (int(joints_2d[i, 0]), int(joints_2d[i, 1]))
-        pt2 = (int(joints_2d[j, 0]), int(joints_2d[j, 1]))
-        cv2.line(img, pt1, pt2, color, thickness)
-    for idx in range(joints_2d.shape[0]):
-        pt = (int(joints_2d[idx, 0]), int(joints_2d[idx, 1]))
-        cv2.circle(img, pt, 3, (0, 0, 255), -1)
-    return img
 
 
 def process_video(args):
@@ -85,13 +74,7 @@ def process_video(args):
         batch_bboxes = []
 
         for i in range(start, end):
-            detections = detect_persons(frames[i], detector)
-            if detections:
-                # Use highest-confidence person
-                best = max(detections, key=lambda d: d[4])
-                bbox = best[:4]
-            else:
-                bbox = None  # center crop fallback
+            bbox = detect_best_person(frames[i], detector)
             batch_bboxes.append(bbox)
             img_tensor = preprocess_image(frames[i], bbox)
             batch_imgs.append(img_tensor)
@@ -213,19 +196,7 @@ def process_video(args):
             j2d_np = j2d_crop.numpy()
 
             # Transform from crop space to original image space
-            if bbox is not None:
-                x1, y1, x2, y2 = bbox
-                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-                crop_size = max(x2 - x1, y2 - y1) * 1.2
-            else:
-                size = min(h, w)
-                cx, cy = w / 2, h / 2
-                crop_size = size
-
-            scale = crop_size / 224.0
-            j2d_orig = j2d_np * scale
-            j2d_orig[:, 0] += cx - crop_size / 2
-            j2d_orig[:, 1] += cy - crop_size / 2
+            j2d_orig = crop_to_image_coords(j2d_np, bbox, h, w)
 
             draw_skeleton(vis, j2d_orig)
 

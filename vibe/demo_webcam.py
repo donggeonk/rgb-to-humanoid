@@ -25,20 +25,10 @@ import numpy as np
 import torch
 
 from vibe_model import (
-    VIBE, SMPL_SKELETON,
-    preprocess_image, project_joints_2d, detect_persons, load_detector,
+    VIBE,
+    preprocess_image, project_joints_2d, load_detector,
 )
-
-
-def draw_skeleton(img, joints_2d, color=(0, 255, 0), thickness=2):
-    """Draw SMPL skeleton on image."""
-    for i, j in SMPL_SKELETON:
-        pt1 = (int(joints_2d[i, 0]), int(joints_2d[i, 1]))
-        pt2 = (int(joints_2d[j, 0]), int(joints_2d[j, 1]))
-        cv2.line(img, pt1, pt2, color, thickness)
-    for idx in range(joints_2d.shape[0]):
-        pt = (int(joints_2d[idx, 0]), int(joints_2d[idx, 1]))
-        cv2.circle(img, pt, 4, (0, 0, 255), -1)
+from demo_utils import draw_skeleton, detect_best_person, crop_to_image_coords
 
 
 def run_webcam(args):
@@ -88,12 +78,7 @@ def run_webcam(args):
             t_start = time.time()
 
             # Detect person
-            detections = detect_persons(frame, detector)
-            if detections:
-                best = max(detections, key=lambda d: d[4])
-                bbox = best[:4]
-            else:
-                bbox = None
+            bbox = detect_best_person(frame, detector)
 
             # Preprocess and extract features
             img_tensor = preprocess_image(frame, bbox).unsqueeze(0).to(device)
@@ -130,18 +115,7 @@ def run_webcam(args):
 
                 # Transform crop coords → original image coords
                 h, w = frame.shape[:2]
-                if bbox is not None:
-                    x1, y1, x2, y2 = bbox
-                    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-                    crop_size = max(x2 - x1, y2 - y1) * 1.2
-                else:
-                    crop_size = min(h, w)
-                    cx, cy = w / 2, h / 2
-
-                scale = crop_size / 224.0
-                j2d_orig = j2d_np * scale
-                j2d_orig[:, 0] += cx - crop_size / 2
-                j2d_orig[:, 1] += cy - crop_size / 2
+                j2d_orig = crop_to_image_coords(j2d_np, bbox, h, w)
 
                 draw_skeleton(vis_frame, j2d_orig)
 
