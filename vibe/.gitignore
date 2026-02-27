@@ -4,3 +4,4 @@ yolov8n.pt
 __pycache__
 webcam_output
 *.mp4
+*.pt

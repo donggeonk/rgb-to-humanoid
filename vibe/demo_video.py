@@ -6,12 +6,13 @@ Processes a video file, detects persons per frame, and runs VIBE to
 produce per-frame SMPL parameters (pose, shape, camera).
 
 Outputs:
-  - smpl_output.npz: SMPL parameters for each frame
-  - overlay.mp4 (optional): visualization with skeleton overlay
+  - smplx_output.npz: SMPL-X parameters for each frame
+  - overlay.mp4 (optional): visualization with skeleton or mesh overlay
 
 Usage:
   python demo_video.py --video input.mp4 --checkpoint resnet50_vibe_pw3d-2e05a122_20211201.pth
   python demo_video.py --video input.mp4 --checkpoint ckpt.pth --output out/ --visualize
+  python demo_video.py --video input.mp4 --checkpoint ckpt.pth --visualize --render_mesh
 """
 
 import argparse
@@ -26,7 +27,10 @@ from vibe_model import (
     VIBE, SMPL_JOINT_NAMES,
     preprocess_image, project_joints_2d, load_detector,
 )
-from demo_utils import draw_skeleton, detect_best_person, crop_to_image_coords
+from demo_utils import (
+    draw_skeleton, detect_best_person, crop_to_image_coords,
+    SMPLRenderer, convert_vibe_to_smplx, smooth_sequence, smooth_bboxes,
+)
 
 
 def extract_frames(video_path):
@@ -160,22 +164,18 @@ def process_video(args):
     print(f"Temporal inference: {infer_time:.1f}s "
           f"({num_frames / infer_time:.1f} FPS)")
 
+    # ---- Temporal smoothing ----
+    smooth_w = args.smooth
+    all_cams = smooth_sequence(all_cams, window=smooth_w)
+    all_bboxes_smooth = smooth_bboxes(all_bboxes, window=smooth_w)
+
     # ---- Phase 3: Save results ----
     os.makedirs(args.output, exist_ok=True)
-    npz_path = os.path.join(args.output, 'smpl_output.npz')
-    np.savez(
-        npz_path,
-        pred_rotmat=all_rotmats,       # (N, 24, 3, 3)
-        pred_shape=all_shapes,          # (N, 10)
-        pred_cam=all_cams,              # (N, 3)
-        joints_3d=all_joints,           # (N, 24, 3)
-        vertices=all_verts,             # (N, 6890, 3)
-        pose_axis_angle=all_pose_aa,    # (N, 24, 3)
-        bboxes=np.array([b if b is not None else [0, 0, 0, 0]
-                         for b in all_bboxes]),
-        fps=fps,
-    )
-    print(f"[Saved] SMPL parameters → {npz_path}")
+    smplx_dict = convert_vibe_to_smplx(
+        all_pose_aa, all_shapes, all_cams, fps, gender=args.gender)
+    npz_path = os.path.join(args.output, 'smplx_output.npz')
+    np.savez(npz_path, **smplx_dict)
+    print(f"[Saved] SMPL-X parameters → {npz_path}")
 
     # ---- Phase 4: Visualization ----
     if args.visualize:
@@ -184,21 +184,34 @@ def process_video(args):
         h, w = frames[0].shape[:2]
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         writer = cv2.VideoWriter(out_video, fourcc, fps, (w, h))
+        
+        # Initialize mesh renderer if requested
+        renderer = None
+        if args.render_mesh:
+            faces = model.smpl.faces.cpu().numpy()
+            renderer = SMPLRenderer(faces)
+            print("[Renderer] Initialized SMPL mesh renderer")
 
         for i in range(num_frames):
             vis = frames[i].copy()
-            bbox = all_bboxes[i]
-            joints_3d = torch.from_numpy(all_joints[i])
-            cam = torch.from_numpy(all_cams[i])
+            bbox = all_bboxes_smooth[i]
+            
+            if renderer is not None:
+                vis = renderer.render_on_image(
+                    vis, all_verts[i], all_cams[i], bbox, h, w)
+            else:
+                # Draw skeleton only
+                joints_3d = torch.from_numpy(all_joints[i])
+                cam = torch.from_numpy(all_cams[i])
 
-            # Project joints to 2D in crop space
-            j2d_crop = project_joints_2d(joints_3d, cam, img_size=224)
-            j2d_np = j2d_crop.numpy()
+                # Project joints to 2D in crop space
+                j2d_crop = project_joints_2d(joints_3d, cam, img_size=224)
+                j2d_np = j2d_crop.numpy()
 
-            # Transform from crop space to original image space
-            j2d_orig = crop_to_image_coords(j2d_np, bbox, h, w)
+                # Transform from crop space to original image space
+                j2d_orig = crop_to_image_coords(j2d_np, bbox, h, w)
 
-            draw_skeleton(vis, j2d_orig)
+                draw_skeleton(vis, j2d_orig)
 
             # Frame info
             cv2.putText(vis, f'Frame {i}/{num_frames}', (10, 30),
@@ -229,6 +242,13 @@ def main():
                         help='Batch size for feature extraction')
     parser.add_argument('--visualize', action='store_true',
                         help='Render skeleton overlay video')
+    parser.add_argument('--render_mesh', action='store_true',
+                        help='Render SMPL mesh (requires --visualize)')
+    parser.add_argument('--smooth', type=int, default=5,
+                        help='Smoothing window for cam/bbox (default: 5, 1=off)')
+    parser.add_argument('--gender', default='neutral',
+                        choices=['neutral', 'male', 'female'],
+                        help='Gender for SMPL-X output (default: neutral)')
     args = parser.parse_args()
     process_video(args)
 

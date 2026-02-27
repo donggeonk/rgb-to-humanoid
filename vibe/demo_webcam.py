@@ -7,12 +7,12 @@ VIBE temporal inference to estimate SMPL body model parameters.
 
 Controls:
   q     - Quit and save results
-  s     - Toggle SMPL vertex output
+  m     - Toggle mesh rendering
   space - Pause/resume
 
 Usage:
   python demo_webcam.py --checkpoint resnet50_vibe_pw3d-2e05a122_20211201.pth
-  python demo_webcam.py --checkpoint ckpt.pth --camera 0 --output webcam_output/
+  python demo_webcam.py --checkpoint ckpt.pth --camera 0 --output webcam_output/ --render_mesh
 """
 
 import argparse
@@ -28,7 +28,10 @@ from vibe_model import (
     VIBE,
     preprocess_image, project_joints_2d, load_detector,
 )
-from demo_utils import draw_skeleton, detect_best_person, crop_to_image_coords
+from demo_utils import (
+    draw_skeleton, detect_best_person, crop_to_image_coords,
+    SMPLRenderer, convert_vibe_to_smplx, OneEuroFilter,
+)
 
 
 def run_webcam(args):
@@ -52,6 +55,14 @@ def run_webcam(args):
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"[Webcam] Resolution: {actual_w}x{actual_h}")
+    
+    # Initialize mesh renderer if requested
+    renderer = None
+    render_mesh = args.render_mesh
+    if render_mesh:
+        faces = model.smpl.faces.cpu().numpy()
+        renderer = SMPLRenderer(faces)
+        print("[Renderer] Initialized SMPL mesh renderer")
 
     # Rolling feature buffer for temporal inference
     feature_buffer = deque(maxlen=seq_len)
@@ -65,8 +76,13 @@ def run_webcam(args):
 
     # For FPS computation
     fps_counter = deque(maxlen=30)
+    session_start = time.time()
 
-    print("\n[Controls] q=quit  space=pause  i=toggle info")
+    # Real-time smoothing filters (One-Euro)
+    cam_filter = OneEuroFilter(dim=3, fps=30.0, min_cutoff=0.8, beta=0.01)
+    bbox_filter = OneEuroFilter(dim=4, fps=30.0, min_cutoff=0.5, beta=0.005)
+
+    print("\n[Controls] q=quit  space=pause  m=toggle mesh  i=toggle info")
     print("[Status] Warming up temporal buffer...\n")
 
     while True:
@@ -78,7 +94,13 @@ def run_webcam(args):
             t_start = time.time()
 
             # Detect person
-            bbox = detect_best_person(frame, detector)
+            bbox_raw = detect_best_person(frame, detector)
+
+            # Smooth bounding box
+            if bbox_raw is not None:
+                bbox = bbox_filter(bbox_raw).tolist()
+            else:
+                bbox = bbox_raw
 
             # Preprocess and extract features
             img_tensor = preprocess_image(frame, bbox).unsqueeze(0).to(device)
@@ -103,21 +125,32 @@ def run_webcam(args):
                     'shape': output['pred_shape'][0, t_idx].cpu().numpy(),
                     'cam': output['pred_cam'][0, t_idx].cpu().numpy(),
                     'joints': output['joints'][0, t_idx].cpu().numpy(),
+                    'vertices': output['vertices'][0, t_idx].cpu().numpy(),
                     'pose_aa': output['pose_axis_angle'][0, t_idx].cpu().numpy(),
                 }
                 all_results.append(result)
 
-                # Project and draw skeleton
-                joints_3d = output['joints'][0, t_idx]
-                cam = output['pred_cam'][0, t_idx]
-                j2d_crop = project_joints_2d(joints_3d, cam, img_size=224)
-                j2d_np = j2d_crop.cpu().numpy()
+                # Smooth camera params for rendering
+                cam_smooth = cam_filter(result['cam'])
 
-                # Transform crop coords → original image coords
-                h, w = frame.shape[:2]
-                j2d_orig = crop_to_image_coords(j2d_np, bbox, h, w)
+                # Render mesh or skeleton
+                if render_mesh and renderer is not None:
+                    h, w = frame.shape[:2]
+                    vis_frame = renderer.render_on_image(
+                        vis_frame, result['vertices'], cam_smooth,
+                        bbox, h, w)
+                else:
+                    # Project and draw skeleton
+                    joints_3d = output['joints'][0, t_idx]
+                    cam_t = torch.from_numpy(cam_smooth).float()
+                    j2d_crop = project_joints_2d(joints_3d, cam_t, img_size=224)
+                    j2d_np = j2d_crop.cpu().numpy()
 
-                draw_skeleton(vis_frame, j2d_orig)
+                    # Transform crop coords → original image coords
+                    h, w = frame.shape[:2]
+                    j2d_orig = crop_to_image_coords(j2d_np, bbox, h, w)
+
+                    draw_skeleton(vis_frame, j2d_orig)
 
                 # Draw bounding box
                 if bbox is not None:
@@ -138,9 +171,14 @@ def run_webcam(args):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.putText(vis_frame, f'Frame: {frame_count}', (10, 90),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                # Show render mode
+                mode_text = 'Mesh' if render_mesh else 'Skeleton'
+                cv2.putText(vis_frame, f'Mode: {mode_text}', (10, 120),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
                 if len(feature_buffer) < seq_len:
-                    cv2.putText(vis_frame, 'Warming up...', (10, 130),
+                    cv2.putText(vis_frame, 'Warming up...', (10, 160),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8,
                                 (0, 165, 255), 2)
 
@@ -154,6 +192,12 @@ def run_webcam(args):
             print(f"[{'Paused' if paused else 'Resumed'}]")
         elif key == ord('i'):
             show_info = not show_info
+        elif key == ord('m'):
+            if renderer is not None:
+                render_mesh = not render_mesh
+                print(f"[Render mode: {'Mesh' if render_mesh else 'Skeleton'}]")
+            else:
+                print("[Warning] Renderer not initialised (start with --render_mesh)")
 
     cap.release()
     cv2.destroyAllWindows()
@@ -161,15 +205,18 @@ def run_webcam(args):
     # Save results
     if all_results and args.output:
         os.makedirs(args.output, exist_ok=True)
-        npz_path = os.path.join(args.output, 'webcam_smpl.npz')
-        np.savez(
-            npz_path,
-            pred_rotmat=np.stack([r['rotmat'] for r in all_results]),
-            pred_shape=np.stack([r['shape'] for r in all_results]),
-            pred_cam=np.stack([r['cam'] for r in all_results]),
-            joints_3d=np.stack([r['joints'] for r in all_results]),
-            pose_axis_angle=np.stack([r['pose_aa'] for r in all_results]),
-        )
+        # Estimate fps from capture
+        elapsed = time.time() - session_start
+        est_fps = frame_count / max(elapsed, 1e-6)
+
+        pose_aa = np.stack([r['pose_aa'] for r in all_results])
+        shapes  = np.stack([r['shape']   for r in all_results])
+        cams    = np.stack([r['cam']     for r in all_results])
+
+        smplx_dict = convert_vibe_to_smplx(
+            pose_aa, shapes, cams, est_fps, gender=args.gender)
+        npz_path = os.path.join(args.output, 'smplx_output.npz')
+        np.savez(npz_path, **smplx_dict)
         print(f"\n[Saved] {len(all_results)} frames → {npz_path}")
 
     print(f"Total frames captured: {frame_count}")
@@ -190,6 +237,11 @@ def main():
                         help='Device (cuda/cpu)')
     parser.add_argument('--seq_len', type=int, default=16,
                         help='Temporal sequence length (default: 16)')
+    parser.add_argument('--render_mesh', action='store_true',
+                        help='Render SMPL mesh instead of skeleton')
+    parser.add_argument('--gender', default='neutral',
+                        choices=['neutral', 'male', 'female'],
+                        help='Gender for SMPL-X output (default: neutral)')
     args = parser.parse_args()
     run_webcam(args)
 
