@@ -323,7 +323,7 @@ def run_gvhmr(
     gvhmr_path = os.path.join(ckpt_base, "gvhmr/gvhmr_siga24_release.ckpt")
     hmr2_path = os.path.join(ckpt_base, "hmr2/epoch=10-step=25000-001.ckpt")
     vit_path = os.path.join(ckpt_base, "vitpose/vitpose-s.pth")
-    yolo_path = os.path.join(_THIS_DIR, "yolo26n.pt")
+    yolo_path = os.path.join(ckpt_base, "yolo/yolo26n.pt")
 
     print(f"[GVHMR] Reading: {source}")
     cap = cv2.VideoCapture(source if isinstance(source, int) else str(source))
@@ -593,7 +593,7 @@ def run_webcam(device="cuda", det_conf=0.5, buf_len=120, robot=None):
 
     print("[Webcam] Loading models ...")
     detector = PersonDetector(
-        os.path.join(_THIS_DIR, "yolo26n.pt"), device=device, conf_thr=det_conf
+        os.path.join(ckpt_base, "yolo/yolo26n.pt"), device=device, conf_thr=det_conf
     )
     hmr2 = load_hmr2(
         os.path.join(ckpt_base, "hmr2/epoch=10-step=25000-001.ckpt"), device=device
