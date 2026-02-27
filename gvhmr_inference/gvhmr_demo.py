@@ -16,13 +16,7 @@ import numpy as np
 import torch
 import cv2
 from tqdm import tqdm
-
-# Add this file's directory to path for sibling imports
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-if _THIS_DIR not in sys.path:
-    sys.path.insert(0, _THIS_DIR)
-
-from hmr2_model import load_hmr2, crop_and_resize, preprocess_image
+from hmr2_model import load_hmr2, crop_and_resize
 from vitpose_model import build_vitpose
 from gvhmr_model import (
     GVHMRModel,
@@ -33,11 +27,21 @@ from gvhmr_model import (
     static_cam_angvel,
     gaussian_smooth,
 )
+from ultralytics import YOLO
 
-# ImageNet normalization constants (avoid recreating every frame)
+# Add this file's directory to path for sibling imports
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+
+
+# ImageNet normalization constants
 _IMAGENET_MEAN_NP = np.float32([0.485, 0.456, 0.406])
 _IMAGENET_STD_NP = np.float32([0.229, 0.224, 0.225])
-_IMAGENET_MEAN_T = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+
+_IMAGENET_MEAN_T = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(
+    3, 1, 1
+)
 _IMAGENET_STD_T = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
 # GVHMR→SMPLX coordinate correction: (x,y,z) → (x,-z,y)
@@ -132,8 +136,6 @@ def keypoints_from_heatmaps(heatmaps, center, scale, use_udp=True):
 
 class PersonDetector:
     def __init__(self, ckpt_path, device="cuda", conf_thr=0.5):
-        from ultralytics import YOLO
-
         self.model = YOLO(ckpt_path)
         self.model.to(device)
         self.device = device
@@ -261,8 +263,9 @@ def _crop_to_vitpose_tensor(crop_bgr):
 
 
 @torch.no_grad()
-def _extract_all_features(frames_bgr, bbx_xys, hmr2_model, vitpose_model,
-                          device="cuda", batch_size=16):
+def _extract_all_features(
+    frames_bgr, bbx_xys, hmr2_model, vitpose_model, device="cuda", batch_size=16
+):
     """Extract HMR2 features and ViTPose keypoints in one pass (shared crops)."""
     F = len(frames_bgr)
 
@@ -277,7 +280,7 @@ def _extract_all_features(frames_bgr, bbx_xys, hmr2_model, vitpose_model,
     # HMR2 batched inference
     all_feats = []
     for start in tqdm(range(0, F, batch_size), desc="HMR2", leave=False):
-        batch = torch.stack(hmr2_tensors[start:start + batch_size]).to(device)
+        batch = torch.stack(hmr2_tensors[start : start + batch_size]).to(device)
         all_feats.append(hmr2_model({"img": batch}).cpu())
     f_imgseq = torch.cat(all_feats, 0)
     del all_feats
@@ -285,9 +288,9 @@ def _extract_all_features(frames_bgr, bbx_xys, hmr2_model, vitpose_model,
     # ViTPose batched inference
     all_kps = []
     for start in tqdm(range(0, F, batch_size), desc="ViTPose", leave=False):
-        batch = torch.stack(vit_tensors[start:start + batch_size]).to(device)
+        batch = torch.stack(vit_tensors[start : start + batch_size]).to(device)
         hm = vitpose_model(batch)
-        bxys_batch = bbx_xys[start:start + batch_size]
+        bxys_batch = bbx_xys[start : start + batch_size]
         scale_np = (
             np.stack([bxys_batch[:, 2] * 24 / 32, bxys_batch[:, 2]], axis=1) / 200.0
         )
@@ -374,7 +377,8 @@ def run_gvhmr(
         out = model(
             obs=normalize_kp2d(kp2d.unsqueeze(0), bbx_t).to(device),
             f_cliffcam=compute_bbox_info_bedlam(
-                bbx_t, K.unsqueeze(0).unsqueeze(1).expand(1, F, -1, -1),
+                bbx_t,
+                K.unsqueeze(0).unsqueeze(1).expand(1, F, -1, -1),
             ).to(device),
             f_cam_angvel=cam_angvel.unsqueeze(0).to(device),
             f_imgseq=f_imgseq.unsqueeze(0).to(device),
@@ -433,10 +437,22 @@ def run_gvhmr(
 
 # COCO-17 skeleton edges for drawing
 _COCO_SKELETON = [
-    (0, 1), (0, 2), (1, 3), (2, 4),
-    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
-    (5, 11), (6, 12), (11, 12),
-    (11, 13), (13, 15), (12, 14), (14, 16),
+    (0, 1),
+    (0, 2),
+    (1, 3),
+    (2, 4),
+    (5, 6),
+    (5, 7),
+    (7, 9),
+    (6, 8),
+    (8, 10),
+    (5, 11),
+    (6, 12),
+    (11, 12),
+    (11, 13),
+    (13, 15),
+    (12, 14),
+    (14, 16),
 ]
 
 
@@ -444,8 +460,13 @@ def _draw_kp2d(frame, kp2d, bbx, conf_thr=0.3):
     """Draw 2D keypoints and bbox on frame (in-place)."""
     cx, cy, s = bbx
     half = s / 2
-    cv2.rectangle(frame, (int(cx - half), int(cy - half)),
-                  (int(cx + half), int(cy + half)), (0, 255, 0), 2)
+    cv2.rectangle(
+        frame,
+        (int(cx - half), int(cy - half)),
+        (int(cx + half), int(cy + half)),
+        (0, 255, 0),
+        2,
+    )
     for i, j in _COCO_SKELETON:
         if kp2d[i, 2] > conf_thr and kp2d[j, 2] > conf_thr:
             p1 = (int(kp2d[i, 0]), int(kp2d[i, 1]))
@@ -480,16 +501,20 @@ def _quat_mul_batch(q1, q2):
     """Hamilton product: q1 (4,) x q2 (N, 4) → (N, 4). Scalar-first convention."""
     w1, x1, y1, z1 = q1
     w2, x2, y2, z2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
-    return np.stack([
-        w1*w2 - x1*x2 - y1*y2 - z1*z2,
-        w1*x2 + x1*w2 + y1*z2 - z1*y2,
-        w1*y2 - x1*z2 + y1*w2 + z1*x2,
-        w1*z2 + x1*y2 - y1*x2 + z1*w2,
-    ], axis=-1)
+    return np.stack(
+        [
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ],
+        axis=-1,
+    )
 
 
-def _smplx_frame_to_joint_dict(body_model, global_orient, body_pose, betas, transl,
-                                _cache={}):
+def _smplx_frame_to_joint_dict(
+    body_model, global_orient, body_pose, betas, transl, _cache={}
+):
     """Run SMPLX forward for one frame and return {joint_name: (pos, quat)} dict.
 
     Uses cached constants to avoid per-frame allocations.
@@ -498,6 +523,7 @@ def _smplx_frame_to_joint_dict(body_model, global_orient, body_pose, betas, tran
     if "corr_quat" not in _cache:
         from scipy.spatial.transform import Rotation as Rot
         from smplx.joint_names import JOINT_NAMES
+
         R_corr = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], dtype=np.float64)
         _cache["R_corr"] = R_corr
         _cache["corr_quat"] = Rot.from_matrix(R_corr).as_quat(scalar_first=True)
@@ -551,7 +577,10 @@ def _smplx_frame_to_joint_dict(body_model, global_orient, body_pose, betas, tran
     corrected_quats = _quat_mul_batch(corr_quat, all_quats)
     corrected_pos = joints @ R_corr.T
 
-    return {name: (corrected_pos[i], corrected_quats[i]) for i, name in enumerate(joint_names)}
+    return {
+        name: (corrected_pos[i], corrected_quats[i])
+        for i, name in enumerate(joint_names)
+    }
 
 
 def run_webcam(device="cuda", det_conf=0.5, buf_len=120, robot=None):
@@ -578,17 +607,26 @@ def run_webcam(device="cuda", det_conf=0.5, buf_len=120, robot=None):
 
     # SMPLX body model (CPU, for joint extraction)
     smplx_model = smplx_lib.create(
-        os.path.join(gmr_base, "assets/body_models"), "smplx",
-        gender="neutral", use_pca=False,
+        os.path.join(gmr_base, "assets/body_models"),
+        "smplx",
+        gender="neutral",
+        use_pca=False,
     )
     smplx_model.eval()
 
     # GMR retargeting + viewer (optional)
     retarget, viewer = None, None
     if robot:
-        from general_motion_retargeting import GeneralMotionRetargeting, RobotMotionViewer
+        from general_motion_retargeting import (
+            GeneralMotionRetargeting,
+            RobotMotionViewer,
+        )
+
         retarget = GeneralMotionRetargeting(
-            actual_human_height=1.66, src_human="smplx", tgt_robot=robot, verbose=False,
+            actual_human_height=1.66,
+            src_human="smplx",
+            tgt_robot=robot,
+            verbose=False,
         )
         viewer = RobotMotionViewer(robot_type=robot, motion_fps=30, transparent_robot=0)
 
@@ -625,13 +663,22 @@ def run_webcam(device="cuda", det_conf=0.5, buf_len=120, robot=None):
             if prev_bbx is None:
                 bbx = max(dets, key=lambda b: b[2])
             else:
-                bbx = dets[np.argmin([np.linalg.norm(d[:2] - prev_bbx[:2]) for d in dets])]
+                bbx = dets[
+                    np.argmin([np.linalg.norm(d[:2] - prev_bbx[:2]) for d in dets])
+                ]
             bbx[2] = np.clip(bbx[2], 32, max(W, H) * 2)
         elif prev_bbx is not None:
             bbx = prev_bbx.copy()
         else:
-            cv2.putText(frame, "No person", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            cv2.putText(
+                frame,
+                "No person",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 255, 0),
+                2,
+            )
             cv2.imshow("GVHMR Webcam", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
@@ -647,7 +694,9 @@ def run_webcam(device="cuda", det_conf=0.5, buf_len=120, robot=None):
         feat_buf.append(f_img)
         kp_buf.append(kp)
         if len(bbx_buf) > buf_len:
-            bbx_buf.pop(0); feat_buf.pop(0); kp_buf.pop(0)
+            bbx_buf.pop(0)
+            feat_buf.pop(0)
+            kp_buf.pop(0)
 
         L = len(bbx_buf)
         gvhmr_out = None
@@ -670,7 +719,9 @@ def run_webcam(device="cuda", det_conf=0.5, buf_len=120, robot=None):
                 bbx_xys=bbx_t.to(device),
                 K_fullimg=K.unsqueeze(0).to(device),
             )
-            lat["gvhmr"] = a * (time.perf_counter() - t1) * 1000 + (1 - a) * lat["gvhmr"]
+            lat["gvhmr"] = (
+                a * (time.perf_counter() - t1) * 1000 + (1 - a) * lat["gvhmr"]
+            )
 
         # --- SMPLX forward + GMR retarget ---
         if gvhmr_out is not None and retarget is not None:
@@ -683,7 +734,9 @@ def run_webcam(device="cuda", det_conf=0.5, buf_len=120, robot=None):
                 pg["betas"][0, -1].cpu().float(),
                 pg["transl"][0, -1].cpu().float(),
             )
-            lat["smplx"] = a * (time.perf_counter() - t1) * 1000 + (1 - a) * lat["smplx"]
+            lat["smplx"] = (
+                a * (time.perf_counter() - t1) * 1000 + (1 - a) * lat["smplx"]
+            )
 
             t1 = time.perf_counter()
             qpos = retarget.retarget(joint_dict, offset_to_ground=True)
@@ -691,12 +744,17 @@ def run_webcam(device="cuda", det_conf=0.5, buf_len=120, robot=None):
 
             t1 = time.perf_counter()
             viewer.step(
-                root_pos=qpos[:3], root_rot=qpos[3:7], dof_pos=qpos[7:],
+                root_pos=qpos[:3],
+                root_rot=qpos[3:7],
+                dof_pos=qpos[7:],
                 human_motion_data=retarget.scaled_human_data,
                 human_pos_offset=np.array([0.0, 0.0, 0.0]),
-                rate_limit=False, follow_camera=False,
+                rate_limit=False,
+                follow_camera=False,
             )
-            lat["viewer"] = a * (time.perf_counter() - t1) * 1000 + (1 - a) * lat["viewer"]
+            lat["viewer"] = (
+                a * (time.perf_counter() - t1) * 1000 + (1 - a) * lat["viewer"]
+            )
 
         # --- Draw overlay ---
         _draw_kp2d(frame, kp_buf[-1].numpy(), bbx_buf[-1])
@@ -709,8 +767,15 @@ def run_webcam(device="cuda", det_conf=0.5, buf_len=120, robot=None):
             f"smplx:{lat['smplx']:.0f} gmr:{lat['gmr']:.0f} view:{lat['viewer']:.0f}"
         )
         for i, line in enumerate(lines):
-            cv2.putText(frame, line, (10, 25 + i * 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.putText(
+                frame,
+                line,
+                (10, 25 + i * 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2,
+            )
         cv2.imshow("GVHMR Webcam", frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
@@ -740,11 +805,16 @@ def main():
     parser.add_argument("--det_conf", type=float, default=0.5)
     parser.add_argument("--no_smooth", action="store_false", dest="smooth")
     parser.add_argument(
-        "--robot", type=str, default="unitree_g1",
+        "--robot",
+        type=str,
+        default="unitree_g1",
         help="Robot type for GMR retargeting in webcam mode (e.g. unitree_g1)",
     )
     parser.add_argument(
-        "--visualize", type=str, default=None, metavar="OUT_VIDEO",
+        "--visualize",
+        type=str,
+        default=None,
+        metavar="OUT_VIDEO",
         help="Render SMPL-X overlay video to this path (requires pyrender, smplx)",
     )
     parser.add_argument(
@@ -756,14 +826,23 @@ def main():
         run_webcam(device=args.device, det_conf=args.det_conf, robot=args.robot)
     else:
         run_gvhmr(
-            args.video, args.out, args.static_cam, args.device,
-            args.batch_size, args.det_conf, args.smooth,
+            args.video,
+            args.out,
+            args.static_cam,
+            args.device,
+            args.batch_size,
+            args.det_conf,
+            args.smooth,
         )
         if args.visualize:
             from gvhmr_visualize import visualize
+
             visualize(
-                args.video, args.out, args.visualize,
-                mode=args.vis_mode, device=args.device,
+                args.video,
+                args.out,
+                args.visualize,
+                mode=args.vis_mode,
+                device=args.device,
             )
 
 
