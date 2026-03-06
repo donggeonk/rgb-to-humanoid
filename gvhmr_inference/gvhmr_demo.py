@@ -15,6 +15,7 @@ import math
 import numpy as np
 import torch
 import cv2
+from scipy.spatial.transform import Rotation
 from tqdm import tqdm
 from hmr2_model import load_hmr2, crop_and_resize
 from vitpose_model import build_vitpose
@@ -38,7 +39,6 @@ if _THIS_DIR not in sys.path:
 # ImageNet normalization constants
 _IMAGENET_MEAN_NP = np.float32([0.485, 0.456, 0.406])
 _IMAGENET_STD_NP = np.float32([0.229, 0.224, 0.225])
-
 _IMAGENET_MEAN_T = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(
     3, 1, 1
 )
@@ -46,6 +46,18 @@ _IMAGENET_STD_T = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(
 
 # GVHMR→SMPLX coordinate correction: (x,y,z) → (x,-z,y)
 _R_CORR = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], dtype=np.float32)
+
+# Inverse of the internal [0,0,π] any→y-up rotation (self-inverse: R² = I)
+_R_G2TG_INV = torch.tensor([[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]])
+
+
+def _rotate_rotvec(rv: np.ndarray, R: np.ndarray) -> np.ndarray:
+    """Left-multiply rotation-vector array rv (..., 3) by matrix R (3, 3)."""
+    return (
+        Rotation.from_matrix(R @ Rotation.from_rotvec(rv).as_matrix())
+        .as_rotvec()
+        .astype(np.float32)
+    )
 
 
 # ============================================================
@@ -138,7 +150,6 @@ class PersonDetector:
     def __init__(self, ckpt_path, device="cuda", conf_thr=0.5):
         self.model = YOLO(ckpt_path)
         self.model.to(device)
-        self.device = device
         self.conf_thr = conf_thr
 
     @torch.no_grad()
@@ -159,7 +170,7 @@ class PersonDetector:
         return boxes
 
 
-def select_primary_person(dets_per_frame: list):
+def select_primary_person(dets_per_frame: list) -> np.ndarray:
     F = len(dets_per_frame)
     track = np.zeros((F, 3), dtype=np.float32)
     first = next((i for i, d in enumerate(dets_per_frame) if len(d) > 0), None)
@@ -212,10 +223,8 @@ class SimpleVO:
                 )
                 good = [m for m, n in matches if m.distance < 0.7 * n.distance]
                 if len(good) >= 8:
-                    pts0, pts1 = (
-                        np.float32([kp0[m.queryIdx].pt for m in good]),
-                        np.float32([kp1[m.trainIdx].pt for m in good]),
-                    )
+                    pts0 = np.float32([kp0[m.queryIdx].pt for m in good])
+                    pts1 = np.float32([kp1[m.trainIdx].pt for m in good])
                     E, mask = cv2.findEssentialMat(
                         pts0, pts1, K, method=cv2.RANSAC, prob=0.999, threshold=1.0
                     )
@@ -242,23 +251,28 @@ class SimpleVO:
 
 
 def _crop_to_hmr2_tensor(crop_bgr):
-    """Convert 256x256 BGR crop to (1,3,256,256) normalized float32 tensor (CPU)."""
+    """256×256 BGR crop → (3,256,256) normalized float32 tensor."""
     rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
     t = torch.from_numpy(rgb).float().div_(255.0).permute(2, 0, 1)
-    t.sub_(_IMAGENET_MEAN_T).div_(_IMAGENET_STD_T)
-    return t  # (3, 256, 256)
+    return t.sub_(_IMAGENET_MEAN_T).div_(_IMAGENET_STD_T)
 
 
 def _crop_to_vitpose_tensor(crop_bgr):
-    """Convert 256x256 BGR crop to ViTPose input (1,3,256,192) float32 tensor (CPU)."""
+    """256×256 BGR crop → (3,256,192) normalized float32 tensor."""
     rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
     rgb = (rgb / 255.0 - _IMAGENET_MEAN_NP) / _IMAGENET_STD_NP
-    t = torch.from_numpy(rgb.transpose(2, 0, 1))
-    return t[:, :, 32:224]  # (3, 256, 192) — center crop width
+    return torch.from_numpy(rgb.transpose(2, 0, 1))[:, :, 32:224]
+
+
+def _kp2d_from_vitpose(hm_np, bbx_xys_np):
+    """Convert a batch of ViTPose heatmaps + bounding boxes to (N,17,3) keypoints."""
+    scale_np = np.stack([bbx_xys_np[:, 2] * 24 / 32, bbx_xys_np[:, 2]], axis=1) / 200.0
+    preds, maxvals = keypoints_from_heatmaps(hm_np, bbx_xys_np[:, :2], scale_np)
+    return torch.from_numpy(np.concatenate([preds, maxvals], -1).astype(np.float32))
 
 
 # ============================================================
-# Feature extraction (static video mode)
+# Feature extraction
 # ============================================================
 
 
@@ -266,10 +280,8 @@ def _crop_to_vitpose_tensor(crop_bgr):
 def _extract_all_features(
     frames_bgr, bbx_xys, hmr2_model, vitpose_model, device="cuda", batch_size=16
 ):
-    """Extract HMR2 features and ViTPose keypoints in one pass (shared crops)."""
+    """Extract HMR2 image features and ViTPose keypoints for all frames."""
     F = len(frames_bgr)
-
-    # Crop once, build both input tensors
     hmr2_tensors = []
     vit_tensors = []
     for i in range(F):
@@ -277,36 +289,40 @@ def _extract_all_features(
         hmr2_tensors.append(_crop_to_hmr2_tensor(crop))
         vit_tensors.append(_crop_to_vitpose_tensor(crop))
 
-    # HMR2 batched inference
     all_feats = []
     for start in tqdm(range(0, F, batch_size), desc="HMR2", leave=False):
         batch = torch.stack(hmr2_tensors[start : start + batch_size]).to(device)
         all_feats.append(hmr2_model({"img": batch}).cpu())
     f_imgseq = torch.cat(all_feats, 0)
-    del all_feats
 
-    # ViTPose batched inference
     all_kps = []
     for start in tqdm(range(0, F, batch_size), desc="ViTPose", leave=False):
         batch = torch.stack(vit_tensors[start : start + batch_size]).to(device)
-        hm = vitpose_model(batch)
-        bxys_batch = bbx_xys[start : start + batch_size]
-        scale_np = (
-            np.stack([bxys_batch[:, 2] * 24 / 32, bxys_batch[:, 2]], axis=1) / 200.0
-        )
-        preds, maxvals = keypoints_from_heatmaps(
-            hm.cpu().numpy(), bxys_batch[:, :2], scale_np
-        )
-        all_kps.append(
-            torch.from_numpy(np.concatenate([preds, maxvals], -1).astype(np.float32))
-        )
+        hm = vitpose_model(batch).cpu().numpy()
+        all_kps.append(_kp2d_from_vitpose(hm, bbx_xys[start : start + batch_size]))
     kp2d = torch.cat(all_kps, 0)
 
     return f_imgseq, kp2d
 
 
+@torch.no_grad()
+def _extract_single_frame(frame_bgr, bbx, hmr2_model, vitpose_model, device):
+    """Extract HMR2 features and ViTPose keypoints for one frame."""
+    crop, _ = crop_and_resize(frame_bgr, bbx[:2], bbx[2])
+    f_img = hmr2_model(
+        {"img": _crop_to_hmr2_tensor(crop).unsqueeze(0).to(device)}
+    ).cpu()
+    hm = (
+        vitpose_model(_crop_to_vitpose_tensor(crop).unsqueeze(0).to(device))
+        .cpu()
+        .numpy()
+    )
+    kp = _kp2d_from_vitpose(hm, bbx[None])[0]
+    return f_img[0], kp
+
+
 # ============================================================
-# Main inference pipeline (static video)
+# Main inference pipeline (video)
 # ============================================================
 
 
@@ -338,11 +354,11 @@ def run_gvhmr(
     if not frames:
         raise RuntimeError("No frames read")
     frames_np = np.stack(frames)
-    del frames  # free list (frames_np owns the data now)
+    del frames
     F, H, W = frames_np.shape[:3]
     K = estimate_K(W, H)
 
-    # --- Detection ---
+    # Detection
     detector = PersonDetector(yolo_path, device=device, conf_thr=det_conf)
     dets = [
         detector.detect_frame(frames_np[f])
@@ -352,38 +368,45 @@ def run_gvhmr(
     bbx_np = select_primary_person(dets)
     bbx_np[:, 2] = np.clip(bbx_np[:, 2], 32, max(W, H) * 2)
 
-    # --- Feature extraction (shared crops, sequential model loading) ---
+    # Smooth the bbox track so noisy YOLO detections don't propagate into
+    # keypoint normalization and depth estimation (same fix as webcam mode).
+    bbx_t_smooth = torch.from_numpy(bbx_np).T.unsqueeze(0)  # (1, 3, F)
+    bbx_t_smooth = gaussian_smooth(bbx_t_smooth, sigma=2.0, dim=-1)
+    bbx_np = bbx_t_smooth[0].T.numpy()
+
+    # Feature extraction
     hmr2 = load_hmr2(hmr2_path, device=device)
     vitpose = build_vitpose(vit_path, device=device)
     f_imgseq, kp2d = _extract_all_features(
         frames_np, bbx_np, hmr2, vitpose, device=device, batch_size=batch_size
     )
     del hmr2, vitpose
+
     if not static_cam:
         print("[GVHMR] Running SimpleVO ...")
         R_w2c = SimpleVO().compute(frames_np)
-    del frames_np  # free the large frame array
+    del frames_np
 
-    # --- Camera angular velocity ---
-    if static_cam:
-        cam_angvel = static_cam_angvel(F, torch.device("cpu"))
-    else:
-        cam_angvel = compute_cam_angvel(torch.from_numpy(R_w2c))
+    cam_angvel = (
+        static_cam_angvel(F, torch.device("cpu"))
+        if static_cam
+        else compute_cam_angvel(torch.from_numpy(R_w2c))
+    )
 
-    # --- GVHMR inference ---
+    # GVHMR inference
     model = GVHMRModel.from_pretrained(gvhmr_path, device=device)
     bbx_t = torch.from_numpy(bbx_np).unsqueeze(0)
     with torch.no_grad():
         out = model(
             obs=normalize_kp2d(kp2d.unsqueeze(0), bbx_t).to(device),
             f_cliffcam=compute_bbox_info_bedlam(
-                bbx_t,
-                K.unsqueeze(0).unsqueeze(1).expand(1, F, -1, -1),
+                bbx_t, K.unsqueeze(0).unsqueeze(1).expand(1, F, -1, -1)
             ).to(device),
             f_cam_angvel=cam_angvel.unsqueeze(0).to(device),
             f_imgseq=f_imgseq.unsqueeze(0).to(device),
             bbx_xys=bbx_t.to(device),
             K_fullimg=K.unsqueeze(0).to(device),
+            foot_contact_threshold=0.3,
         )
     del model
 
@@ -401,20 +424,10 @@ def run_gvhmr(
     betas_10 = pg["betas"][0].numpy()
     betas_16 = np.concatenate([betas_10, np.zeros(6, dtype=betas_10.dtype)])
 
-    # Convert GVHMR coords to SMPLX convention
-    from scipy.spatial.transform import Rotation
-
-    def _rotate_rotvec(rv, R):
-        mats = Rotation.from_rotvec(rv).as_matrix()
-        return Rotation.from_matrix(R @ mats).as_rotvec().astype(np.float32)
-
-    g_orient = _rotate_rotvec(pg["global_orient"].numpy(), _R_CORR)
-    g_trans = pg["transl"].numpy() @ _R_CORR.T
-
     res = {
-        "root_orient": g_orient,
+        "root_orient": _rotate_rotvec(pg["global_orient"].numpy(), _R_CORR),
         "pose_body": pg["body_pose"].numpy(),
-        "trans": g_trans,
+        "trans": pg["transl"].numpy() @ _R_CORR.T,
         "betas": betas_16,
         "gender": np.array("neutral"),
         "mocap_frame_rate": np.array(fps),
@@ -457,7 +470,6 @@ _COCO_SKELETON = [
 
 
 def _draw_kp2d(frame, kp2d, bbx, conf_thr=0.3):
-    """Draw 2D keypoints and bbox on frame (in-place)."""
     cx, cy, s = bbx
     half = s / 2
     cv2.rectangle(
@@ -469,36 +481,20 @@ def _draw_kp2d(frame, kp2d, bbx, conf_thr=0.3):
     )
     for i, j in _COCO_SKELETON:
         if kp2d[i, 2] > conf_thr and kp2d[j, 2] > conf_thr:
-            p1 = (int(kp2d[i, 0]), int(kp2d[i, 1]))
-            p2 = (int(kp2d[j, 0]), int(kp2d[j, 1]))
-            cv2.line(frame, p1, p2, (0, 200, 255), 2)
+            cv2.line(
+                frame,
+                (int(kp2d[i, 0]), int(kp2d[i, 1])),
+                (int(kp2d[j, 0]), int(kp2d[j, 1])),
+                (0, 200, 255),
+                2,
+            )
     for k in range(17):
         if kp2d[k, 2] > conf_thr:
             cv2.circle(frame, (int(kp2d[k, 0]), int(kp2d[k, 1])), 3, (0, 0, 255), -1)
 
 
-@torch.no_grad()
-def _extract_single_frame(frame_bgr, bbx, hmr2_model, vitpose_model, device):
-    """Extract HMR2 features and ViTPose keypoints for a single frame (shared crop)."""
-    crop, _ = crop_and_resize(frame_bgr, bbx[:2], bbx[2])
-
-    # HMR2
-    hmr2_in = _crop_to_hmr2_tensor(crop).unsqueeze(0).to(device)
-    f_img = hmr2_model({"img": hmr2_in}).cpu()
-
-    # ViTPose
-    vit_in = _crop_to_vitpose_tensor(crop).unsqueeze(0).to(device)
-    hm = vitpose_model(vit_in)
-    scale_np = np.array([[bbx[2] * 24 / 32, bbx[2]]], dtype=np.float32) / 200.0
-    preds, maxvals = keypoints_from_heatmaps(
-        hm.cpu().numpy(), bbx[:2].reshape(1, 2), scale_np
-    )
-    kp = torch.from_numpy(np.concatenate([preds, maxvals], -1).astype(np.float32))[0]
-    return f_img[0], kp
-
-
 def _quat_mul_batch(q1, q2):
-    """Hamilton product: q1 (4,) x q2 (N, 4) → (N, 4). Scalar-first convention."""
+    """Hamilton product q1 (4,) × q2 (N,4) → (N,4), scalar-first."""
     w1, x1, y1, z1 = q1
     w2, x2, y2, z2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
     return np.stack(
@@ -512,37 +508,58 @@ def _quat_mul_batch(q1, q2):
     )
 
 
+def _aa_ema_slerp(
+    raw_aa: np.ndarray, prev_aa: np.ndarray, alpha: float = 0.5
+) -> np.ndarray:
+    """EMA-style smoothing for axis-angle orientations via quaternion SLERP.
+
+    Naive linear blending of axis-angle vectors causes sudden 180° flips
+    because axis-angle is not a smooth manifold (e.g. (axis, θ) and
+    (-axis, 2π−θ) represent near-identical rotations but have wildly
+    different vectors).  This helper converts to quaternions, ensures the
+    short-arc hemisphere, and SLERPs with factor *alpha* for the new
+    observation.
+    """
+    q_raw = Rotation.from_rotvec(raw_aa).as_quat(scalar_first=True)  # (4,)
+    q_prev = Rotation.from_rotvec(prev_aa).as_quat(scalar_first=True)  # (4,)
+    # Ensure shortest-arc: flip q_raw if it's in the opposite hemisphere
+    if np.dot(q_raw, q_prev) < 0:
+        q_raw = -q_raw
+    # SLERP: Rotation.slerp is not available for single pairs; use scipy key_times
+    from scipy.spatial.transform import Slerp
+
+    slerp = Slerp(
+        [0.0, 1.0],
+        Rotation.from_quat(
+            np.stack([q_prev, q_raw])[:, [1, 2, 3, 0]]  # scipy uses scalar-last
+        ),
+    )
+    blended = slerp(alpha)  # at alpha → new observation
+    return blended.as_rotvec().astype(raw_aa.dtype)
+
+
 def _smplx_frame_to_joint_dict(
     body_model, global_orient, body_pose, betas, transl, _cache={}
 ):
-    """Run SMPLX forward for one frame and return {joint_name: (pos, quat)} dict.
-
-    Uses cached constants to avoid per-frame allocations.
-    """
-    # One-time init of cached constants
+    """Run SMPLX forward for one frame; return {joint_name: (pos, quat)} dict."""
     if "corr_quat" not in _cache:
-        from scipy.spatial.transform import Rotation as Rot
         from smplx.joint_names import JOINT_NAMES
 
         R_corr = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], dtype=np.float64)
         _cache["R_corr"] = R_corr
-        _cache["corr_quat"] = Rot.from_matrix(R_corr).as_quat(scalar_first=True)
-        _cache["Rot"] = Rot
+        _cache["corr_quat"] = Rotation.from_matrix(R_corr).as_quat(scalar_first=True)
         _cache["JOINT_NAMES"] = JOINT_NAMES
         _cache["zeros_45"] = torch.zeros(1, 45)
         _cache["zeros_3"] = torch.zeros(1, 3)
 
-    Rot = _cache["Rot"]
     R_corr = _cache["R_corr"]
     corr_quat = _cache["corr_quat"]
     JOINT_NAMES = _cache["JOINT_NAMES"]
 
-    # Truncate/pad betas
     nb = body_model.num_betas
     if betas.shape[0] != nb:
         b = torch.zeros(nb)
-        n = min(betas.shape[0], nb)
-        b[:n] = betas[:n]
+        b[: min(betas.shape[0], nb)] = betas[:nb]
         betas = b
 
     out = body_model(
@@ -563,28 +580,24 @@ def _smplx_frame_to_joint_dict(
     joint_names = JOINT_NAMES[: len(body_model.parents)]
     parents = body_model.parents
 
-    # Build joint orientations using forward kinematics
     joint_oris = []
     for i in range(len(joint_names)):
-        if i == 0:
-            rot = Rot.from_rotvec(go)
-        else:
-            rot = joint_oris[parents[i]] * Rot.from_rotvec(full_pose[i])
+        rot = (
+            Rotation.from_rotvec(go)
+            if i == 0
+            else joint_oris[parents[i]] * Rotation.from_rotvec(full_pose[i])
+        )
         joint_oris.append(rot)
 
-    # Batch-apply coordinate correction
     all_quats = np.array([r.as_quat(scalar_first=True) for r in joint_oris])
-    corrected_quats = _quat_mul_batch(corr_quat, all_quats)
-    corrected_pos = joints @ R_corr.T
-
     return {
-        name: (corrected_pos[i], corrected_quats[i])
+        name: (joints[i] @ R_corr.T, _quat_mul_batch(corr_quat, all_quats)[i])
         for i, name in enumerate(joint_names)
     }
 
 
 def run_webcam(device="cuda", det_conf=0.5, buf_len=120, robot=None):
-    """Real-time webcam loop with GVHMR inference, timing, and optional GMR robot retargeting."""
+    """Real-time webcam loop: GVHMR inference with optional GMR robot retargeting."""
     import time
     import smplx as smplx_lib
 
@@ -604,17 +617,13 @@ def run_webcam(device="cuda", det_conf=0.5, buf_len=120, robot=None):
     gvhmr_model = GVHMRModel.from_pretrained(
         os.path.join(ckpt_base, "gvhmr/gvhmr_siga24_release.ckpt"), device=device
     )
-
-    # SMPLX body model (CPU, for joint extraction)
     smplx_model = smplx_lib.create(
         os.path.join(gmr_base, "assets/body_models"),
         "smplx",
         gender="neutral",
         use_pca=False,
-    )
-    smplx_model.eval()
+    ).eval()
 
-    # GMR retargeting + viewer (optional)
     retarget, viewer = None, None
     if robot:
         from general_motion_retargeting import (
@@ -623,10 +632,7 @@ def run_webcam(device="cuda", det_conf=0.5, buf_len=120, robot=None):
         )
 
         retarget = GeneralMotionRetargeting(
-            actual_human_height=1.66,
-            src_human="smplx",
-            tgt_robot=robot,
-            verbose=False,
+            actual_human_height=1.66, src_human="smplx", tgt_robot=robot, verbose=False
         )
         viewer = RobotMotionViewer(robot_type=robot, motion_fps=30, transparent_robot=0)
 
@@ -637,15 +643,31 @@ def run_webcam(device="cuda", det_conf=0.5, buf_len=120, robot=None):
     H, W = probe.shape[:2]
     K = estimate_K(W, H)
 
-    # Pre-compute static cam_angvel for max buffer length (just slice as needed)
     max_cam_angvel = static_cam_angvel(buf_len, torch.device("cpu"))
 
     # Rolling buffers
     bbx_buf, feat_buf, kp_buf = [], [], []
     prev_bbx = None
-    # Latency tracking (exponential moving average, ms)
-    lat = {"yolo": 0, "feat": 0, "gvhmr": 0, "smplx": 0, "gmr": 0, "viewer": 0}
-    a = 0.3  # EMA smoothing
+    bbx_ema = None  # smoothed bbox (EMA, α=0.4)
+
+    # Translation anchor carried across window slides (Fix 1)
+    transl_anchor = None
+
+    # Per-frame output EMA for streaming smoothness (Fix 3, α=0.5)
+    ema_transl = ema_orient = ema_bpose = None
+
+    # Latency tracking (EMA, α=0.3)
+    lat = {
+        "yolo": 0.0,
+        "feat": 0.0,
+        "gvhmr": 0.0,
+        "smplx": 0.0,
+        "gmr": 0.0,
+        "viewer": 0.0,
+    }
+
+    def _tick(key, t1):
+        lat[key] = 0.3 * (time.perf_counter() - t1) * 1000 + 0.7 * lat[key]
 
     print("[Webcam] Running. Press 'q' to quit.")
     while True:
@@ -654,19 +676,22 @@ def run_webcam(device="cuda", det_conf=0.5, buf_len=120, robot=None):
         if not ret:
             break
 
-        # --- YOLO detection ---
+        # YOLO detection
         t1 = time.perf_counter()
         dets = detector.detect_frame(frame)
-        lat["yolo"] = a * (time.perf_counter() - t1) * 1000 + (1 - a) * lat["yolo"]
+        _tick("yolo", t1)
 
         if dets:
-            if prev_bbx is None:
-                bbx = max(dets, key=lambda b: b[2])
-            else:
-                bbx = dets[
+            bbx = (
+                max(dets, key=lambda b: b[2])
+                if prev_bbx is None
+                else dets[
                     np.argmin([np.linalg.norm(d[:2] - prev_bbx[:2]) for d in dets])
                 ]
+            )
             bbx[2] = np.clip(bbx[2], 32, max(W, H) * 2)
+            bbx_ema = bbx.copy() if bbx_ema is None else 0.4 * bbx + 0.6 * bbx_ema
+            bbx = bbx_ema.copy()
         elif prev_bbx is not None:
             bbx = prev_bbx.copy()
         else:
@@ -685,15 +710,17 @@ def run_webcam(device="cuda", det_conf=0.5, buf_len=120, robot=None):
             continue
         prev_bbx = bbx
 
-        # --- Feature extraction (HMR2 + ViTPose, shared crop) ---
+        # Feature extraction
         t1 = time.perf_counter()
         f_img, kp = _extract_single_frame(frame, bbx, hmr2, vitpose, device)
-        lat["feat"] = a * (time.perf_counter() - t1) * 1000 + (1 - a) * lat["feat"]
+        _tick("feat", t1)
 
         bbx_buf.append(bbx)
         feat_buf.append(f_img)
         kp_buf.append(kp)
-        if len(bbx_buf) > buf_len:
+
+        window_slid = len(bbx_buf) > buf_len
+        if window_slid:
             bbx_buf.pop(0)
             feat_buf.pop(0)
             kp_buf.pop(0)
@@ -701,46 +728,63 @@ def run_webcam(device="cuda", det_conf=0.5, buf_len=120, robot=None):
         L = len(bbx_buf)
         gvhmr_out = None
 
-        # --- GVHMR inference ---
         if L >= 2:
             t1 = time.perf_counter()
             bbx_t = torch.from_numpy(np.stack(bbx_buf)).unsqueeze(0)
-            kp_t = torch.stack(kp_buf).unsqueeze(0)
-            feat_t = torch.stack(feat_buf).unsqueeze(0)
-            cam_angvel = max_cam_angvel[:L]
-
             gvhmr_out = gvhmr_model(
-                obs=normalize_kp2d(kp_t, bbx_t).to(device),
+                obs=normalize_kp2d(torch.stack(kp_buf).unsqueeze(0), bbx_t).to(device),
                 f_cliffcam=compute_bbox_info_bedlam(
                     bbx_t, K.unsqueeze(0).unsqueeze(1).expand(1, L, -1, -1)
                 ).to(device),
-                f_cam_angvel=cam_angvel.unsqueeze(0).to(device),
-                f_imgseq=feat_t.to(device),
+                f_cam_angvel=max_cam_angvel[:L].unsqueeze(0).to(device),
+                f_imgseq=torch.stack(feat_buf).unsqueeze(0).to(device),
                 bbx_xys=bbx_t.to(device),
                 K_fullimg=K.unsqueeze(0).to(device),
+                transl_0=transl_anchor,
+                foot_contact_threshold=0.3,
             )
-            lat["gvhmr"] = (
-                a * (time.perf_counter() - t1) * 1000 + (1 - a) * lat["gvhmr"]
-            )
+            _tick("gvhmr", t1)
 
-        # --- SMPLX forward + GMR retarget ---
+            # Update translation anchor for next slide.
+            # pg["transl"] is post-R_g2tg([0,0,π]); invert via _R_G2TG_INV (self-inverse)
+            # before passing back into rollout_local_transl_vel next call.
+            if window_slid:
+                t1_post = gvhmr_out["smpl_params_global"]["transl"][:, 1:2, :]
+                transl_anchor = torch.einsum(
+                    "ij,...j->...i", _R_G2TG_INV.to(t1_post), t1_post
+                )
+            else:
+                transl_anchor = None
+
         if gvhmr_out is not None and retarget is not None:
             pg = gvhmr_out["smpl_params_global"]
+            raw_t = pg["transl"][0, -1].cpu().float().numpy()
+            raw_o = pg["global_orient"][0, -1].cpu().float().numpy()
+            raw_b = pg["body_pose"][0, -1].cpu().float().numpy()
+            if ema_transl is None:
+                ema_transl, ema_orient, ema_bpose = (
+                    raw_t.copy(),
+                    raw_o.copy(),
+                    raw_b.copy(),
+                )
+            else:
+                ema_transl = 0.5 * raw_t + 0.5 * ema_transl
+                ema_orient = _aa_ema_slerp(raw_o, ema_orient, alpha=0.5)
+                ema_bpose = 0.5 * raw_b + 0.5 * ema_bpose
+
             t1 = time.perf_counter()
             joint_dict = _smplx_frame_to_joint_dict(
                 smplx_model,
-                pg["global_orient"][0, -1].cpu().float(),
-                pg["body_pose"][0, -1].cpu().float(),
+                torch.from_numpy(ema_orient),
+                torch.from_numpy(ema_bpose),
                 pg["betas"][0, -1].cpu().float(),
-                pg["transl"][0, -1].cpu().float(),
+                torch.from_numpy(ema_transl),
             )
-            lat["smplx"] = (
-                a * (time.perf_counter() - t1) * 1000 + (1 - a) * lat["smplx"]
-            )
+            _tick("smplx", t1)
 
             t1 = time.perf_counter()
             qpos = retarget.retarget(joint_dict, offset_to_ground=True)
-            lat["gmr"] = a * (time.perf_counter() - t1) * 1000 + (1 - a) * lat["gmr"]
+            _tick("gmr", t1)
 
             t1 = time.perf_counter()
             viewer.step(
@@ -750,32 +794,33 @@ def run_webcam(device="cuda", det_conf=0.5, buf_len=120, robot=None):
                 human_motion_data=retarget.scaled_human_data,
                 human_pos_offset=np.array([0.0, 0.0, 0.0]),
                 rate_limit=False,
-                follow_camera=False,
+                follow_camera=True,
             )
-            lat["viewer"] = (
-                a * (time.perf_counter() - t1) * 1000 + (1 - a) * lat["viewer"]
-            )
+            _tick("viewer", t1)
 
-        # --- Draw overlay ---
         _draw_kp2d(frame, kp_buf[-1].numpy(), bbx_buf[-1])
 
         total_ms = (time.perf_counter() - t0) * 1000
-        fps = 1000.0 / max(total_ms, 0.1)
-        lines = [f"FPS: {fps:.1f}  buf: {L}/{buf_len}  total: {total_ms:.0f}ms"]
-        lines.append(
-            f"yolo:{lat['yolo']:.0f} feat:{lat['feat']:.0f} gvhmr:{lat['gvhmr']:.0f} "
-            f"smplx:{lat['smplx']:.0f} gmr:{lat['gmr']:.0f} view:{lat['viewer']:.0f}"
+        fps_disp = 1000.0 / max(total_ms, 0.1)
+        cv2.putText(
+            frame,
+            f"FPS: {fps_disp:.1f}  buf: {L}/{buf_len}  total: {total_ms:.0f}ms",
+            (10, 25),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2,
         )
-        for i, line in enumerate(lines):
-            cv2.putText(
-                frame,
-                line,
-                (10, 25 + i * 25),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 255, 0),
-                2,
-            )
+        cv2.putText(
+            frame,
+            f"yolo:{lat['yolo']:.0f} feat:{lat['feat']:.0f} gvhmr:{lat['gvhmr']:.0f} "
+            f"smplx:{lat['smplx']:.0f} gmr:{lat['gmr']:.0f} view:{lat['viewer']:.0f}",
+            (10, 50),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2,
+        )
         cv2.imshow("GVHMR Webcam", frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
@@ -808,14 +853,14 @@ def main():
         "--robot",
         type=str,
         default="unitree_g1",
-        help="Robot type for GMR retargeting in webcam mode (e.g. unitree_g1)",
+        help="Robot type for GMR retargeting in webcam mode",
     )
     parser.add_argument(
         "--visualize",
         type=str,
         default=None,
         metavar="OUT_VIDEO",
-        help="Render SMPL-X overlay video to this path (requires pyrender, smplx)",
+        help="Render SMPL-X overlay video (requires pyrender, smplx)",
     )
     parser.add_argument(
         "--vis_mode", default="incam", choices=["incam", "global", "side_by_side"]
