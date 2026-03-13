@@ -321,6 +321,118 @@ def _extract_single_frame(frame_bgr, bbx, hmr2_model, vitpose_model, device):
     return f_img[0], kp
 
 
+def _resolve_joint_name(joint_names, candidates):
+    for name in candidates:
+        if name in joint_names:
+            return name
+    raise KeyError(f"None of {candidates} found in SMPL-X joints")
+
+
+def _save_and_plot_foot_traj(pg, output_path, fps, body_model_dir=None):
+    """Save and plot torso-relative left/right foot trajectories for video mode."""
+    import smplx as smplx_lib
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+    from smplx.joint_names import JOINT_NAMES
+
+    if body_model_dir is None:
+        body_model_dir = os.path.join(_THIS_DIR, "..", "GMR", "assets", "body_models")
+
+    if not os.path.isdir(body_model_dir):
+        raise FileNotFoundError(f"SMPL-X body model dir not found: {body_model_dir}")
+
+    body_model = smplx_lib.create(
+        body_model_dir,
+        "smplx",
+        gender="neutral",
+        use_pca=False,
+    ).eval()
+
+    F = pg["transl"].shape[0]
+    nb = getattr(body_model, "num_betas", int(pg["betas"].shape[-1]))
+    betas_one = torch.zeros(nb, dtype=pg["transl"].dtype)
+    ncopy = min(nb, int(pg["betas"].shape[-1]))
+    betas_one[:ncopy] = pg["betas"][0, :ncopy]
+    betas_f = betas_one.unsqueeze(0).expand(F, -1)
+    zeros_45 = torch.zeros(F, 45, dtype=pg["transl"].dtype)
+    zeros_3 = torch.zeros(F, 3, dtype=pg["transl"].dtype)
+    num_expr = getattr(body_model, "num_expression_coeffs", 10)
+    zeros_expr = torch.zeros(F, num_expr, dtype=pg["transl"].dtype)
+    smplx_out = body_model(
+        global_orient=pg["global_orient"],
+        body_pose=pg["body_pose"],
+        betas=betas_f,
+        transl=pg["transl"],
+        expression=zeros_expr,
+        left_hand_pose=zeros_45,
+        right_hand_pose=zeros_45,
+        jaw_pose=zeros_3,
+        leye_pose=zeros_3,
+        reye_pose=zeros_3,
+        return_verts=False,
+    )
+
+    joint_names = JOINT_NAMES[: len(body_model.parents)]
+    joints = smplx_out.joints[:, : len(joint_names), :].detach().cpu().numpy()
+    joints = joints @ _R_CORR.T
+
+    torso_name = _resolve_joint_name(
+        joint_names,
+        ["spine3", "spine2", "spine1", "pelvis"],
+    )
+    lfoot_name = _resolve_joint_name(joint_names, ["left_foot", "left_ankle"])
+    rfoot_name = _resolve_joint_name(joint_names, ["right_foot", "right_ankle"])
+
+    torso = joints[:, joint_names.index(torso_name)]
+    left_foot = joints[:, joint_names.index(lfoot_name)]
+    right_foot = joints[:, joint_names.index(rfoot_name)]
+    left_rel = left_foot - torso
+    right_rel = right_foot - torso
+
+    traj_path = os.path.splitext(output_path)[0] + "_foot_traj.npz"
+    np.savez(
+        traj_path,
+        fps=np.array(fps, dtype=np.float32),
+        torso_joint=np.array(torso_name),
+        left_foot_joint=np.array(lfoot_name),
+        right_foot_joint=np.array(rfoot_name),
+        torso_xyz=torso,
+        left_foot_xyz=left_foot,
+        right_foot_xyz=right_foot,
+        left_foot_rel_xyz=left_rel,
+        right_foot_rel_xyz=right_rel,
+    )
+
+    t = np.arange(F, dtype=np.float32) / max(float(fps), 1e-6)
+
+    plot_path = os.path.splitext(output_path)[0] + "_foot_traj.png"
+    fig, (ax_top, ax_xy) = plt.subplots(1, 2, figsize=(11, 5))
+
+    ax_top.plot(t, left_rel[:, 2], label=f"L ({lfoot_name})", lw=1.7)
+    ax_top.plot(t, right_rel[:, 2], label=f"R ({rfoot_name})", lw=1.7)
+    ax_top.set_title("Top-down Z vs Time, relative to torso")
+    ax_top.set_xlabel("Time (s)")
+    ax_top.set_ylabel("Z")
+    ax_top.grid(alpha=0.3)
+    ax_top.legend()
+
+    ax_xy.plot(left_rel[:, 0], left_rel[:, 1], label=f"L ({lfoot_name})", lw=1.7)
+    ax_xy.plot(right_rel[:, 0], right_rel[:, 1], label=f"R ({rfoot_name})", lw=1.7)
+    ax_xy.set_title("X-Y plane, relative to torso")
+    ax_xy.set_xlabel("X")
+    ax_xy.set_ylabel("Y")
+    ax_xy.axis("equal")
+    ax_xy.grid(alpha=0.3)
+    ax_xy.legend()
+
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=180)
+    plt.close(fig)
+    return traj_path, plot_path
+
+
 # ============================================================
 # Main inference pipeline (video)
 # ============================================================
@@ -334,6 +446,7 @@ def run_gvhmr(
     batch_size: int = 16,
     det_conf: float = 0.5,
     smooth: bool = True,
+    body_model_dir: str = None,
 ):
     ckpt_base = os.path.join(_THIS_DIR, "checkpoints")
     gvhmr_path = os.path.join(ckpt_base, "gvhmr/gvhmr_siga24_release.ckpt")
@@ -441,6 +554,15 @@ def run_gvhmr(
     }
     np.savez(output_path, **res)
     print(f"[GVHMR] Saved → {output_path}")
+
+    traj_path, plot_path = _save_and_plot_foot_traj(
+        pg,
+        output_path=output_path,
+        fps=fps,
+        body_model_dir=body_model_dir,
+    )
+    print(f"[GVHMR] Saved foot trajectories → {traj_path}")
+    print(f"[GVHMR] Saved foot trajectory plot → {plot_path}")
     return res
 
 
@@ -850,6 +972,12 @@ def main():
     parser.add_argument("--det_conf", type=float, default=0.5)
     parser.add_argument("--no_smooth", action="store_false", dest="smooth")
     parser.add_argument(
+        "--body_model_dir",
+        type=str,
+        default=None,
+        help="Path to SMPL-X body models (default: ../GMR/assets/body_models)",
+    )
+    parser.add_argument(
         "--robot",
         type=str,
         default="unitree_g1",
@@ -878,6 +1006,7 @@ def main():
             args.batch_size,
             args.det_conf,
             args.smooth,
+            args.body_model_dir,
         )
         if args.visualize:
             from gvhmr_visualize import visualize

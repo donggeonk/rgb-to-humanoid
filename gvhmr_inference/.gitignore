@@ -3,3 +3,4 @@ checkpoints
 yolo*
 *.npz
 *.mp4
+*.png
