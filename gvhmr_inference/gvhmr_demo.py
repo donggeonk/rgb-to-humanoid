@@ -328,8 +328,20 @@ def _resolve_joint_name(joint_names, candidates):
     raise KeyError(f"None of {candidates} found in SMPL-X joints")
 
 
-def _save_and_plot_foot_traj(pg, output_path, fps, body_model_dir=None):
-    """Save and plot torso-relative left/right foot trajectories for video mode."""
+def _save_and_plot_foot_traj(
+    pg, output_path, fps, body_model_dir=None, static_conf_logits=None
+):
+    """Save and plot torso-relative left/right foot trajectories for video mode.
+
+    Args:
+        pg: global SMPL parameters dict (tensors).
+        output_path: base path for output files.
+        fps: video frame rate.
+        body_model_dir: path to SMPL-X body models directory.
+        static_conf_logits: (F, 6) tensor of raw foot-contact logits from GVHMR
+            (channels 0-2 = left foot, 3-5 = right foot).  Optional; if provided,
+            per-foot stationary probability curves are added to the plot.
+    """
     import smplx as smplx_lib
     import matplotlib
 
@@ -388,12 +400,22 @@ def _save_and_plot_foot_traj(pg, output_path, fps, body_model_dir=None):
     torso = joints[:, joint_names.index(torso_name)]
     left_foot = joints[:, joint_names.index(lfoot_name)]
     right_foot = joints[:, joint_names.index(rfoot_name)]
-    left_rel = left_foot - torso
-    right_rel = right_foot - torso
+    left_rel = left_foot
+    right_rel = right_foot
+
+    # Global root XY trajectory (after coordinate correction)
+    global_xy = pg["transl"].detach().cpu().numpy() @ _R_CORR.T  # (F, 3)
+
+    # Per-foot stationary probabilities from model logits
+    left_contact_prob = right_contact_prob = None
+    if static_conf_logits is not None:
+        logits_np = static_conf_logits.detach().cpu().float().numpy()  # (F, 6)
+        probs = 1.0 / (1.0 + np.exp(-logits_np))  # sigmoid
+        left_contact_prob = probs[:, :3].mean(axis=-1)  # (F,)
+        right_contact_prob = probs[:, 3:].mean(axis=-1)  # (F,)
 
     traj_path = os.path.splitext(output_path)[0] + "_foot_traj.npz"
-    np.savez(
-        traj_path,
+    save_dict = dict(
         fps=np.array(fps, dtype=np.float32),
         torso_joint=np.array(torso_name),
         left_foot_joint=np.array(lfoot_name),
@@ -403,29 +425,90 @@ def _save_and_plot_foot_traj(pg, output_path, fps, body_model_dir=None):
         right_foot_xyz=right_foot,
         left_foot_rel_xyz=left_rel,
         right_foot_rel_xyz=right_rel,
+        global_xy=global_xy,
     )
+    if left_contact_prob is not None:
+        save_dict["left_contact_prob"] = left_contact_prob
+        save_dict["right_contact_prob"] = right_contact_prob
+    np.savez(traj_path, **save_dict)
 
     t = np.arange(F, dtype=np.float32) / max(float(fps), 1e-6)
 
     plot_path = os.path.splitext(output_path)[0] + "_foot_traj.png"
-    fig, (ax_top, ax_xy) = plt.subplots(1, 2, figsize=(11, 5))
+
+    # Layout: 2 rows × 2 columns
+    #   [0,0] Z vs Time   [0,1] X-Y foot plane
+    #   [1,0] Contact prob  [1,1] Global X-Y root
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+    ax_top, ax_xy, ax_contact, ax_global = (
+        axes[0, 0],
+        axes[0, 1],
+        axes[1, 0],
+        axes[1, 1],
+    )
 
     ax_top.plot(t, left_rel[:, 2], label=f"L ({lfoot_name})", lw=1.7)
     ax_top.plot(t, right_rel[:, 2], label=f"R ({rfoot_name})", lw=1.7)
-    ax_top.set_title("Top-down Z vs Time, relative to torso")
+    ax_top.set_title("Foot Z vs Time (global)")
     ax_top.set_xlabel("Time (s)")
-    ax_top.set_ylabel("Z")
+    ax_top.set_ylabel("Z (m)")
     ax_top.grid(alpha=0.3)
     ax_top.legend()
 
     ax_xy.plot(left_rel[:, 0], left_rel[:, 1], label=f"L ({lfoot_name})", lw=1.7)
     ax_xy.plot(right_rel[:, 0], right_rel[:, 1], label=f"R ({rfoot_name})", lw=1.7)
-    ax_xy.set_title("X-Y plane, relative to torso")
-    ax_xy.set_xlabel("X")
-    ax_xy.set_ylabel("Y")
+    ax_xy.set_title("Foot X-Y plane (global)")
+    ax_xy.set_xlabel("X (m)")
+    ax_xy.set_ylabel("Y (m)")
     ax_xy.axis("equal")
     ax_xy.grid(alpha=0.3)
     ax_xy.legend()
+
+    if left_contact_prob is not None:
+        ax_contact.plot(t, left_contact_prob, label="L stationary prob", lw=1.7)
+        ax_contact.plot(t, right_contact_prob, label="R stationary prob", lw=1.7)
+        ax_contact.axhline(0.3, color="gray", lw=1.0, ls="--", label="threshold 0.3")
+        ax_contact.set_ylim(0.0, 1.05)
+    else:
+        ax_contact.text(
+            0.5,
+            0.5,
+            "No contact logits available",
+            ha="center",
+            va="center",
+            transform=ax_contact.transAxes,
+        )
+    ax_contact.set_title("Foot stationary probability vs Time")
+    ax_contact.set_xlabel("Time (s)")
+    ax_contact.set_ylabel("Probability")
+    ax_contact.grid(alpha=0.3)
+    ax_contact.legend()
+
+    ax_global.plot(global_xy[:, 0], global_xy[:, 1], lw=1.7, color="tab:purple")
+    ax_global.scatter(
+        global_xy[0, 0],
+        global_xy[0, 1],
+        marker="o",
+        s=60,
+        color="green",
+        zorder=5,
+        label="start",
+    )
+    ax_global.scatter(
+        global_xy[-1, 0],
+        global_xy[-1, 1],
+        marker="X",
+        s=60,
+        color="red",
+        zorder=5,
+        label="end",
+    )
+    ax_global.set_title("Global root X-Y trajectory")
+    ax_global.set_xlabel("X (m)")
+    ax_global.set_ylabel("Y (m)")
+    ax_global.axis("equal")
+    ax_global.grid(alpha=0.3)
+    ax_global.legend()
 
     fig.tight_layout()
     fig.savefig(plot_path, dpi=180)
@@ -525,6 +608,7 @@ def run_gvhmr(
 
     pi = {k: v[0].cpu() for k, v in out["smpl_params_incam"].items()}
     pg = {k: v[0].cpu() for k, v in out["smpl_params_global"].items()}
+    static_conf_logits = out["static_conf_logits"][0].cpu()  # (F, 6)
 
     if smooth:
         for p in pi:
@@ -560,6 +644,7 @@ def run_gvhmr(
         output_path=output_path,
         fps=fps,
         body_model_dir=body_model_dir,
+        static_conf_logits=static_conf_logits,
     )
     print(f"[GVHMR] Saved foot trajectories → {traj_path}")
     print(f"[GVHMR] Saved foot trajectory plot → {plot_path}")
