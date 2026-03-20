@@ -73,10 +73,18 @@ def axis_angle_to_matrix(aa: torch.Tensor) -> torch.Tensor:
 def matrix_to_axis_angle(R: torch.Tensor) -> torch.Tensor:
     """Rotation matrix → axis-angle.
     R: (..., 3, 3)  →  (..., 3)
+
+    Handles three regimes:
+      - angle ≈ 0   → zero vector
+      - angle ≈ π   → axis from symmetric part (R + Rᵀ) to avoid sin≈0 singularity
+      - otherwise   → standard skew extraction
     """
     trace = R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2]
     cos = ((trace - 1) / 2).clamp(-1 + 1e-7, 1 - 1e-7)
-    angle = torch.acos(cos)
+    angle = torch.acos(cos)  # (...,)
+    sin_angle = torch.sin(angle)
+
+    # --- Standard regime: axis from skew-symmetric part ---
     skew = torch.stack(
         [
             R[..., 2, 1] - R[..., 1, 2],
@@ -85,10 +93,27 @@ def matrix_to_axis_angle(R: torch.Tensor) -> torch.Tensor:
         ],
         dim=-1,
     )
-    # axis-angle = skew / (2 sin θ) * θ
-    axis_angle = (
-        skew / (2 * torch.sin(angle).unsqueeze(-1) + 1e-8) * angle.unsqueeze(-1)
-    )
+    aa_standard = skew / (2 * sin_angle.unsqueeze(-1) + 1e-8) * angle.unsqueeze(-1)
+
+    # --- Near-π regime: axis from symmetric part (R + Rᵀ)/2 ---
+    # When angle ≈ π, R + I ≈ 2 * axis * axisᵀ.  The column with the
+    # largest diagonal element is the most numerically stable estimate of
+    # the rotation axis.
+    Rsym = R + torch.eye(3, device=R.device, dtype=R.dtype)
+    # Pick column with largest diagonal: argmax of diag(R)+1
+    diag = torch.stack([Rsym[..., 0, 0], Rsym[..., 1, 1], Rsym[..., 2, 2]], dim=-1)
+    best_col = diag.argmax(dim=-1)  # (...,)
+
+    # Gather the best column from Rsym
+    bc_expanded = best_col.unsqueeze(-1).unsqueeze(-1).expand(*R.shape[:-1], 1)
+    axis_pi = Rsym.gather(-1, bc_expanded).squeeze(-1)  # (..., 3)
+    axis_pi = F.normalize(axis_pi, dim=-1)
+    aa_pi = axis_pi * angle.unsqueeze(-1)
+
+    # Use the near-π path when sin(angle) is small AND angle is large
+    near_pi = (sin_angle.abs() < 0.08) & (angle > 2.0)
+
+    axis_angle = torch.where(near_pi.unsqueeze(-1), aa_pi, aa_standard)
     # near-zero case → zero vector
     return torch.where(
         (angle < 1e-6).unsqueeze(-1), torch.zeros_like(axis_angle), axis_angle
@@ -112,6 +137,87 @@ def gaussian_smooth(x: torch.Tensor, sigma: float = 3, dim: int = -1) -> torch.T
     x = F.conv1d(x, kernel)
     x = x.squeeze(1).reshape(*x_shape, -1)
     return x.transpose(-1, dim)
+
+
+def _make_aa_continuous(aa: torch.Tensor, dim: int = 0) -> torch.Tensor:
+    """Ensure temporal continuity of an axis-angle sequence.
+
+    Axis-angle has a sign ambiguity: (axis, θ) and (-axis, 2π−θ) represent
+    the same rotation.  Additionally, rotations near ±π can produce axis
+    flips.  This function walks along ``dim`` and flips the representation
+    when the jump between consecutive frames is smaller that way.
+
+    Args:
+        aa: (..., 3) axis-angle tensor with a temporal dimension ``dim``.
+        dim: the temporal dimension (default 0).
+
+    Returns:
+        Adjusted axis-angle tensor with the same rotations but
+        temporally continuous.
+    """
+    aa = aa.clone()
+    n = aa.shape[dim]
+    for i in range(1, n):
+        prev = aa.select(dim, i - 1)
+        curr = aa.select(dim, i)
+        # Alternative representation: negate axis, angle → 2π − angle
+        angle = curr.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        axis = curr / angle
+        alt = -axis * (2 * math.pi - angle)
+        # Pick whichever is closer to prev
+        d_orig = (curr - prev).norm(dim=-1)
+        d_alt = (alt - prev).norm(dim=-1)
+        flip = (d_alt < d_orig).unsqueeze(-1)
+        curr.copy_(torch.where(flip, alt, curr))
+    return aa
+
+
+def gaussian_smooth_rotations(
+    aa: torch.Tensor, sigma: float = 2.0, dim: int = 0
+) -> torch.Tensor:
+    """Smooth a sequence of axis-angle rotations via rotation matrices.
+
+    Direct Gaussian smoothing of axis-angle vectors is incorrect because
+    axis-angle is not a smooth manifold (discontinuity at ±π).  This
+    function:
+      1. Converts to rotation matrices (a continuous representation).
+      2. Applies Gaussian smoothing to the 3×3 matrices.
+      3. Projects back to SO(3) via SVD.
+      4. Converts back to axis-angle.
+
+    Handles both single-rotation (..., 3) and multi-joint (..., J*3) inputs
+    by automatically reshaping when the last dimension is a multiple of 3.
+
+    The result is a valid, temporally smooth rotation sequence.
+    """
+    orig_shape = aa.shape
+    # If the last dim is a flat concatenation of multiple joints (e.g. 63 = 21*3),
+    # reshape to (..., J, 3) so axis_angle_to_matrix sees individual rotations.
+    last = aa.shape[-1]
+    needs_reshape = last > 3 and last % 3 == 0
+    if needs_reshape:
+        aa = aa.reshape(*aa.shape[:-1], -1, 3)  # (..., J, 3)
+
+    R = axis_angle_to_matrix(aa)  # (..., 3, 3)
+    mat_shape = R.shape
+    # Smooth each of the 9 matrix elements independently
+    R_flat = R.reshape(*R.shape[:-2], 9)  # (..., 9)
+    R_smooth = gaussian_smooth(R_flat, sigma=sigma, dim=dim)
+    R_smooth = R_smooth.reshape(mat_shape)
+    # Project back to SO(3) via SVD
+    U, _, Vh = torch.linalg.svd(R_smooth)
+    # Correct for reflections: ensure det > 0
+    det = torch.det(U @ Vh)
+    sign = torch.sign(det).unsqueeze(-1).unsqueeze(-1)
+    # Flip last column of U for negative determinants
+    U_corr = U.clone()
+    U_corr[..., :, -1] = U[..., :, -1] * sign.squeeze(-1)
+    R_proj = U_corr @ Vh
+    result = matrix_to_axis_angle(R_proj)
+
+    if needs_reshape:
+        result = result.reshape(orig_shape)
+    return result
 
 
 # ============================================================
@@ -349,10 +455,12 @@ def get_smpl_params_global(
     R_t_to_0 = as_identity(R_t_to_0)
 
     global_orient = matrix_to_axis_angle(R_t_to_0 @ R_gv)
+    global_orient = _make_aa_continuous(global_orient, dim=-2)
     transl = rollout_local_transl_vel(
         local_transl_vel, global_orient, transl_0=transl_0
     )
     global_orient, transl, _ = get_tgtcoord_rootparam(global_orient, transl)
+    global_orient = _make_aa_continuous(global_orient, dim=-2)
     return {"global_orient": global_orient, "transl": transl}
 
 

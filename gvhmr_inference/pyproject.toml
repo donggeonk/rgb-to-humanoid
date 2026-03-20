@@ -1,0 +1,31 @@
+[project]
+name = "gvhmr-inference"
+version = "0.1.0"
+description = "Self-contained GVHMR inference pipeline with optional GMR robot retargeting"
+requires-python = ">=3.10"
+dependencies = [
+  # Core inference
+  "torch",
+  "numpy",
+  "opencv-python",
+  "einops",
+  "timm",
+  "scipy",
+  "ultralytics",
+  "tqdm",
+  # Visualization (SMPL overlay)
+  "pyrender",
+  "smplx",
+  "trimesh",
+  "matplotlib",
+  # GMR retargeting (installed as editable from local path)
+  "general-motion-retargeting",
+]
+
+[tool.uv]
+find-links = ["https://download.pytorch.org/whl/cu126"]
+# proxsuite wheel is not available for this platform; override to drop the extra
+override-dependencies = ["qpsolvers"]
+
+[tool.uv.sources]
+general-motion-retargeting = { path = "../GMR", editable = true }

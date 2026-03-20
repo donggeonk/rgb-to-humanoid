@@ -27,6 +27,7 @@ from gvhmr_model import (
     compute_cam_angvel,
     static_cam_angvel,
     gaussian_smooth,
+    gaussian_smooth_rotations,
 )
 from ultralytics import YOLO
 
@@ -52,12 +53,28 @@ _R_G2TG_INV = torch.tensor([[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]]
 
 
 def _rotate_rotvec(rv: np.ndarray, R: np.ndarray) -> np.ndarray:
-    """Left-multiply rotation-vector array rv (..., 3) by matrix R (3, 3)."""
-    return (
+    """Left-multiply rotation-vector array rv (..., 3) by matrix R (3, 3).
+
+    Ensures temporal continuity: consecutive frames won't flip axis
+    due to the rotvec ±π ambiguity.
+    """
+    result = (
         Rotation.from_matrix(R @ Rotation.from_rotvec(rv).as_matrix())
         .as_rotvec()
         .astype(np.float32)
     )
+    # Enforce temporal continuity along the first axis
+    if result.ndim >= 2 and result.shape[0] > 1:
+        for i in range(1, result.shape[0]):
+            curr = result[i]
+            prev = result[i - 1]
+            angle = np.linalg.norm(curr)
+            if angle > 1e-6:
+                axis = curr / angle
+                alt = -axis * (2 * np.pi - angle)
+                if np.linalg.norm(alt - prev) < np.linalg.norm(curr - prev):
+                    result[i] = alt
+    return result
 
 
 # ============================================================
@@ -467,7 +484,7 @@ def _save_and_plot_foot_traj(
     if left_contact_prob is not None:
         ax_contact.plot(t, left_contact_prob, label="L stationary prob", lw=1.7)
         ax_contact.plot(t, right_contact_prob, label="R stationary prob", lw=1.7)
-        ax_contact.axhline(0.3, color="gray", lw=1.0, ls="--", label="threshold 0.3")
+        ax_contact.axhline(0.15, color="gray", lw=1.0, ls="--", label="threshold 0.15")
         ax_contact.set_ylim(0.0, 1.05)
     else:
         ax_contact.text(
@@ -602,7 +619,7 @@ def run_gvhmr(
             f_imgseq=f_imgseq.unsqueeze(0).to(device),
             bbx_xys=bbx_t.to(device),
             K_fullimg=K.unsqueeze(0).to(device),
-            foot_contact_threshold=0.3,
+            foot_contact_threshold=0.15,
         )
     del model
 
@@ -610,12 +627,24 @@ def run_gvhmr(
     pg = {k: v[0].cpu() for k, v in out["smpl_params_global"].items()}
     static_conf_logits = out["static_conf_logits"][0].cpu()  # (F, 6)
 
+    # Rotation fields need rotation-aware smoothing (axis-angle is
+    # discontinuous at ±π).  Non-rotation fields use standard Gaussian.
+    _ROT_KEYS = {"global_orient", "body_pose"}
+
     if smooth:
         for p in pi:
-            if p != "betas":
+            if p == "betas":
+                continue
+            if p in _ROT_KEYS:
+                pi[p] = gaussian_smooth_rotations(pi[p], sigma=2.0, dim=0)
+            else:
                 pi[p] = gaussian_smooth(pi[p], sigma=2.0, dim=0)
         for p in pg:
-            if p != "betas":
+            if p == "betas":
+                continue
+            if p in _ROT_KEYS:
+                pg[p] = gaussian_smooth_rotations(pg[p], sigma=2.0, dim=0)
+            else:
                 pg[p] = gaussian_smooth(pg[p], sigma=2.0, dim=0)
 
     betas_10 = pg["betas"][0].numpy()
@@ -948,7 +977,7 @@ def run_webcam(device="cuda", det_conf=0.5, buf_len=120, robot=None):
                 bbx_xys=bbx_t.to(device),
                 K_fullimg=K.unsqueeze(0).to(device),
                 transl_0=transl_anchor,
-                foot_contact_threshold=0.3,
+                foot_contact_threshold=0.15,
             )
             _tick("gvhmr", t1)
 
