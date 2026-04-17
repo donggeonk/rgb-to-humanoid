@@ -424,12 +424,20 @@ def _save_and_plot_foot_traj(
     global_xy = pg["transl"].detach().cpu().numpy() @ _R_CORR.T  # (F, 3)
 
     # Per-foot stationary probabilities from model logits
+    # Channels:
+    # 0 = 7 = Left Ankle
+    # 1 = 10 = Left Foot
+    # 2 = 8 = Right Ankle
+    # 3 = 11 = Right Foot
+    # 4 = 20 = Left Wrist
+    # 5 = 21 = Right Wrist
     left_contact_prob = right_contact_prob = None
     if static_conf_logits is not None:
         logits_np = static_conf_logits.detach().cpu().float().numpy()  # (F, 6)
+        # probs = logits_np
         probs = 1.0 / (1.0 + np.exp(-logits_np))  # sigmoid
-        left_contact_prob = probs[:, :3].mean(axis=-1)  # (F,)
-        right_contact_prob = probs[:, 3:].mean(axis=-1)  # (F,)
+        left_contact_prob = probs[:, 1]
+        right_contact_prob = probs[:, 3]
 
     traj_path = os.path.splitext(output_path)[0] + "_foot_traj.npz"
     save_dict = dict(
@@ -484,7 +492,6 @@ def _save_and_plot_foot_traj(
     if left_contact_prob is not None:
         ax_contact.plot(t, left_contact_prob, label="L stationary prob", lw=1.7)
         ax_contact.plot(t, right_contact_prob, label="R stationary prob", lw=1.7)
-        ax_contact.axhline(0.15, color="gray", lw=1.0, ls="--", label="threshold 0.15")
         ax_contact.set_ylim(0.0, 1.05)
     else:
         ax_contact.text(
@@ -552,7 +559,7 @@ def run_gvhmr(
     gvhmr_path = os.path.join(ckpt_base, "gvhmr/gvhmr_siga24_release.ckpt")
     hmr2_path = os.path.join(ckpt_base, "hmr2/epoch=10-step=25000-001.ckpt")
     vit_path = os.path.join(ckpt_base, "vitpose/vitpose-s.pth")
-    yolo_path = os.path.join(ckpt_base, "yolo/yolo26n.pt")
+    yolo_path = os.path.join(ckpt_base, "yolo/yolo26s.pt")
 
     print(f"[GVHMR] Reading: {source}")
     cap = cv2.VideoCapture(source if isinstance(source, int) else str(source))
@@ -619,7 +626,6 @@ def run_gvhmr(
             f_imgseq=f_imgseq.unsqueeze(0).to(device),
             bbx_xys=bbx_t.to(device),
             K_fullimg=K.unsqueeze(0).to(device),
-            foot_contact_threshold=0.15,
         )
     del model
 
@@ -977,7 +983,6 @@ def run_webcam(device="cuda", det_conf=0.5, buf_len=120, robot=None):
                 bbx_xys=bbx_t.to(device),
                 K_fullimg=K.unsqueeze(0).to(device),
                 transl_0=transl_anchor,
-                foot_contact_threshold=0.15,
             )
             _tick("gvhmr", t1)
 

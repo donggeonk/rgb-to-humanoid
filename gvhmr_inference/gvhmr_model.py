@@ -5,6 +5,8 @@ Implements the GVHMR denoiser (NetworkEncoderRoPE) and all geometric utilities.
 """
 
 import math
+import os
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -344,52 +346,238 @@ def get_tgtcoord_rootparam(global_orient: torch.Tensor, transl: torch.Tensor):
     return new_orient, new_transl, R_g2tg
 
 
-def apply_foot_contact_constraints(
-    local_transl_vel: torch.Tensor,
-    static_conf_logits: torch.Tensor,
-    conf_threshold: float = 0.3,
-) -> torch.Tensor:
-    """Suppress root translation velocity when either foot is in static contact.
+def _normalize(vec: torch.Tensor) -> torch.Tensor:
+    return F.normalize(vec, dim=-1, eps=1e-8)
 
-    The model outputs ``static_conf_logits`` with shape (B, L, 6).  The 6
-    channels correspond to contact probabilities for 3 left-foot vertices
-    (channels 0-2) and 3 right-foot vertices (channels 3-5).
 
-    Instead of averaging all 6 channels (which dilutes single-foot contact
-    during walking), we compute per-foot contact as the mean of each foot's
-    3 vertices and take the **max** across left/right — so *either* foot
-    being planted triggers the constraint.
+def _mat_get_rotation(mat: torch.Tensor) -> torch.Tensor:
+    return mat[..., :3, :3]
 
-    We also use **soft damping** instead of hard binary zeroing: the xz
-    velocity is scaled by ``(1 - damping_factor)`` where the damping factor
-    ramps smoothly from 0 to 1 over the range [conf_threshold, 1.0].  This
-    prevents discontinuous velocity jumps at the contact boundary that cause
-    visible foot sliding.
 
-    Args:
-        local_transl_vel:   (B, L, 3) local root velocity
-        static_conf_logits: (B, L, 6) raw logits from static_conf_head
-        conf_threshold:     probability above which damping begins (default 0.3)
-    Returns:
-        local_transl_vel with xz damped for contact frames  (B, L, 3)
-    """
-    probs = torch.sigmoid(static_conf_logits)  # (B, L, 6)
+def _mat_get_position(mat: torch.Tensor) -> torch.Tensor:
+    return mat[..., :3, 3]
 
-    # Per-foot contact: mean over 3 vertices each, then max across feet
-    left_prob = probs[..., :3].mean(dim=-1)  # (B, L)
-    right_prob = probs[..., 3:].mean(dim=-1)  # (B, L)
-    contact_prob = torch.max(left_prob, right_prob)  # (B, L)
 
-    # Soft damping: linearly ramp from 0→1 over [threshold, 1.0]
-    # damping = 0 when contact_prob <= threshold (no suppression)
-    # damping = 1 when contact_prob >= 1.0 (full suppression)
-    damping = ((contact_prob - conf_threshold) / (1.0 - conf_threshold)).clamp(0.0, 1.0)
+def _mat_get_TRS(rot_mat: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+    mat = torch.eye(4, device=pos.device, dtype=pos.dtype)
+    mat = mat.expand(*pos.shape[:-1], 4, 4).clone()
+    mat[..., :3, :3] = rot_mat
+    mat[..., :3, 3] = pos
+    return mat
 
-    vel = local_transl_vel.clone()
-    scale = 1.0 - damping  # (B, L)
-    vel[..., 0] = vel[..., 0] * scale
-    vel[..., 2] = vel[..., 2] * scale
-    return vel
+
+def _mat_forward_kinematics(local_mat: torch.Tensor, parents: list[int]) -> torch.Tensor:
+    global_mat = local_mat.clone()
+    for j, parent in enumerate(parents):
+        if parent == -1:
+            continue
+        global_mat[..., j, :, :] = global_mat[..., parent, :, :] @ global_mat[..., j, :, :]
+    return global_mat
+
+
+def _axis_angle_to_quaternion(aa: torch.Tensor) -> torch.Tensor:
+    angle = aa.norm(dim=-1, keepdim=True)
+    half = angle * 0.5
+    axis = aa / angle.clamp(min=1e-8)
+    quat = torch.cat([torch.cos(half), axis * torch.sin(half)], dim=-1)
+    identity = torch.zeros_like(quat)
+    identity[..., 0] = 1.0
+    return torch.where((angle < 1e-8).expand_as(quat), identity, quat)
+
+
+def _matrix_to_quaternion(R: torch.Tensor) -> torch.Tensor:
+    return _axis_angle_to_quaternion(matrix_to_axis_angle(R))
+
+
+def _quaternion_to_matrix(q: torch.Tensor) -> torch.Tensor:
+    q = q / q.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    w, x, y, z = q.unbind(dim=-1)
+    return torch.stack(
+        [
+            1 - 2 * (y * y + z * z),
+            2 * (x * y - z * w),
+            2 * (x * z + y * w),
+            2 * (x * y + z * w),
+            1 - 2 * (x * x + z * z),
+            2 * (y * z - x * w),
+            2 * (x * z - y * w),
+            2 * (y * z + x * w),
+            1 - 2 * (x * x + y * y),
+        ],
+        dim=-1,
+    ).reshape(*q.shape[:-1], 3, 3)
+
+
+def _qinv(q: torch.Tensor) -> torch.Tensor:
+    q_inv = q.clone()
+    q_inv[..., 1:] *= -1
+    return q_inv
+
+
+def _qmul(q: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
+    terms = torch.matmul(r.unsqueeze(-1), q.unsqueeze(-2))
+    w = terms[..., 0, 0] - terms[..., 1, 1] - terms[..., 2, 2] - terms[..., 3, 3]
+    x = terms[..., 0, 1] + terms[..., 1, 0] - terms[..., 2, 3] + terms[..., 3, 2]
+    y = terms[..., 0, 2] + terms[..., 1, 3] + terms[..., 2, 0] - terms[..., 3, 1]
+    z = terms[..., 0, 3] - terms[..., 1, 2] + terms[..., 2, 1] + terms[..., 3, 0]
+    return torch.stack((w, x, y, z), dim=-1)
+
+
+def _qrot(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    qvec = q[..., 1:]
+    uv = torch.cross(qvec, v, dim=-1)
+    uuv = torch.cross(qvec, uv, dim=-1)
+    return v + 2 * (q[..., :1] * uv + uuv)
+
+
+def _qnormalize(q: torch.Tensor) -> torch.Tensor:
+    return q / torch.clamp(torch.norm(q, dim=-1, keepdim=True), min=1e-8)
+
+
+def _qpow(q0: torch.Tensor, t, dtype=torch.float32) -> torch.Tensor:
+    q0 = _qnormalize(q0)
+    theta0 = torch.acos(q0[..., :1].clamp(-1 + 1e-7, 1 - 1e-7))
+    mask = (theta0 <= 1e-9) & (theta0 >= -1e-9)
+    theta0 = torch.where(mask, torch.full_like(theta0, 1e-9), theta0)
+    v0 = q0[..., 1:] / torch.sin(theta0)
+
+    if isinstance(t, torch.Tensor):
+        t = t.to(device=q0.device, dtype=q0.dtype)
+        while t.dim() < theta0.dim():
+            t = t.unsqueeze(-1)
+        theta = t * theta0
+    else:
+        theta = t * theta0
+
+    q = torch.zeros(theta.shape[:-1] + (4,), device=q0.device, dtype=q0.dtype)
+    q[..., :1] = torch.cos(theta)
+    q[..., 1:] = v0 * torch.sin(theta)
+    return q.to(dtype=q0.dtype if dtype is None else dtype)
+
+
+def _qslerp(q0: torch.Tensor, q1: torch.Tensor, t) -> torch.Tensor:
+    q0 = _qnormalize(q0)
+    q1 = _qnormalize(q1)
+    q_ = _qpow(_qmul(q1, _qinv(q0)), t, dtype=q0.dtype)
+    return _qmul(q_, q0)
+
+
+def _qbetween(v0: torch.Tensor, v1: torch.Tensor) -> torch.Tensor:
+    v = torch.cross(v0, v1, dim=-1)
+    w = torch.sqrt((v0.square().sum(dim=-1, keepdim=True) * v1.square().sum(dim=-1, keepdim=True)).clamp(min=1e-8))
+    w = w + (v0 * v1).sum(dim=-1, keepdim=True)
+    y_vec = torch.zeros_like(v)
+    y_vec[..., 1] = 1.0
+    mask = v.norm(dim=-1) == 0
+    mask2 = w.sum(dim=-1).abs() <= 1e-4
+    mask = torch.logical_and(mask, mask2)
+    v[mask] = y_vec[mask]
+    return _qnormalize(torch.cat([w, v], dim=-1))
+
+
+class _CCDIK:
+    def __init__(
+        self,
+        local_mat: torch.Tensor,
+        parents: list[int],
+        target_ind: list[int],
+        target_pos: torch.Tensor | None = None,
+        target_rot: torch.Tensor | None = None,
+        kinematic_chain: list[int] | None = None,
+        max_iter: int = 2,
+        threshold: float = 1e-3,
+        pos_weight: float = 1.0,
+        rot_weight: float = 0.0,
+    ):
+        if kinematic_chain is None:
+            kinematic_chain = list(range(local_mat.shape[-3]))
+
+        global_mat = _mat_forward_kinematics(local_mat, parents)
+        chain_local_mat = local_mat[..., kinematic_chain, :, :].clone()
+        chain_local_mat[..., 0, :, :] = global_mat[..., kinematic_chain[0], :, :]
+
+        self.local_mat = chain_local_mat
+        self.parent = [i - 1 for i in range(len(kinematic_chain))]
+        self.global_mat = _mat_forward_kinematics(self.local_mat, self.parent)
+
+        self.target_ind = target_ind
+        self.target_pos = target_pos
+        self.target_q = _matrix_to_quaternion(target_rot) if target_rot is not None else None
+
+        self.threshold = threshold
+        self.J_N = self.local_mat.shape[-3]
+        self.target_N = len(target_ind)
+        self.max_iter = max_iter
+        self.pos_weight = pos_weight
+        self.rot_weight = rot_weight
+
+    def solve(self) -> torch.Tensor:
+        for _ in range(self.max_iter):
+            self._optimize(1)
+        return self.local_mat
+
+    def _optimize(self, i: int):
+        if i == self.J_N - 1:
+            return
+
+        pos = _mat_get_position(self.global_mat)[..., i, :]
+        rot = _mat_get_rotation(self.global_mat)[..., i, :, :]
+        quat = _matrix_to_quaternion(rot)
+
+        x_vec = torch.zeros(quat.shape[:-1] + (3,), device=quat.device, dtype=quat.dtype)
+        x_vec[..., 0] = 1.0
+        y_vec = torch.zeros_like(x_vec)
+        y_vec[..., 1] = 1.0
+        x_vec_sum = torch.zeros_like(x_vec)
+        y_vec_sum = torch.zeros_like(y_vec)
+        count = 0
+
+        for target_i, j in enumerate(self.target_ind):
+            if i >= j:
+                continue
+
+            end_pos = _mat_get_position(self.global_mat)[..., j, :]
+            end_rot = _mat_get_rotation(self.global_mat)[..., j, :, :]
+            end_quat = _matrix_to_quaternion(end_rot)
+
+            if self.target_pos is not None:
+                target_pos = self.target_pos[..., target_i, :]
+                solved_pos_target_quat = _qslerp(
+                    quat,
+                    _qmul(_qbetween(end_pos - pos, target_pos - pos), quat),
+                    self.get_weight(i),
+                )
+                x_vec_sum += _qrot(solved_pos_target_quat, x_vec)
+                y_vec_sum += _qrot(solved_pos_target_quat, y_vec)
+                if self.pos_weight > 0:
+                    count += 1
+
+            if self.target_q is not None and target_i == self.target_N - 1 and self.rot_weight > 0:
+                target_q = self.target_q[..., target_i, :]
+                solved_rot_target_quat = _qslerp(
+                    quat,
+                    _qmul(_qmul(target_q, _qinv(end_quat)), quat),
+                    self.get_weight(i),
+                )
+                x_vec_sum += _qrot(solved_rot_target_quat, x_vec) * self.rot_weight
+                y_vec_sum += _qrot(solved_rot_target_quat, y_vec) * self.rot_weight
+                count += 1
+
+        if count > 0:
+            x_vec_avg = _normalize(x_vec_sum / count)
+            y_vec_avg = _normalize(y_vec_sum / count)
+            z_vec_avg = torch.cross(x_vec_avg, y_vec_avg, dim=-1)
+            solved_rot = torch.stack([x_vec_avg, y_vec_avg, z_vec_avg], dim=-1)
+
+            parent_rot = _mat_get_rotation(self.global_mat)[..., self.parent[i], :, :]
+            solved_local_rot = parent_rot.transpose(-1, -2) @ solved_rot
+            self.local_mat[..., i, :3, :3] = solved_local_rot
+            self.global_mat = _mat_forward_kinematics(self.local_mat, self.parent)
+
+        self._optimize(i + 1)
+
+    def get_weight(self, i: int) -> float:
+        return (i + 1) / self.J_N
 
 
 def get_smpl_params_global(
@@ -1102,6 +1290,27 @@ class GVHMRModel(nn.Module):
             self.register_buffer("cam_angvel_mean", cam_mean, persistent=False)
             self.register_buffer("cam_angvel_std", cam_std, persistent=False)
 
+        skeleton_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "smpl_neutral_skeleton.npz"
+        )
+        skeleton = np.load(skeleton_path)
+        self.register_buffer(
+            "smpl_J_template",
+            torch.from_numpy(skeleton["J_template"][:22]).float(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "smpl_J_shapedirs",
+            torch.from_numpy(skeleton["J_shapedirs"][:22]).float(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "smpl_parents",
+            torch.from_numpy(skeleton["parents"][:22]).long(),
+            persistent=False,
+        )
+        self.static_joint_ids = [7, 10, 8, 11, 20, 21]
+
     @classmethod
     def from_pretrained(cls, ckpt_path: str, device: str = "cuda") -> "GVHMRModel":
         model = cls()
@@ -1114,6 +1323,121 @@ class GVHMRModel(nn.Module):
         model.denoiser.load_state_dict(state, strict=True)
         return model.to(device).eval()
 
+    def _smpl_fk(
+        self,
+        body_pose: torch.Tensor,
+        betas: torch.Tensor,
+        global_orient: torch.Tensor = None,
+        transl: torch.Tensor = None,
+        get_intermediate: bool = False,
+    ):
+        """Lightweight SMPL FK on the neutral 22-joint skeleton asset."""
+        B, L = body_pose.shape[:2]
+        if global_orient is None:
+            global_orient = torch.zeros((B, L, 3), device=body_pose.device, dtype=body_pose.dtype)
+
+        aa = torch.cat([global_orient, body_pose], dim=-1).reshape(B, L, 22, 3)
+        rotmat = axis_angle_to_matrix(aa)  # (B, L, 22, 3, 3)
+
+        skeleton = self.smpl_J_template.view(1, 1, 22, 3) + torch.einsum(
+            "blc,jdc->bljd", betas, self.smpl_J_shapedirs
+        )
+        parent_pos = skeleton[..., self.smpl_parents.clamp(min=0), :]
+        local_skeleton = skeleton - parent_pos
+        local_skeleton[..., 0, :] = skeleton[..., 0, :]
+
+        if transl is not None:
+            local_skeleton[..., 0, :] = local_skeleton[..., 0, :] + transl
+
+        local_mat = _mat_get_TRS(rotmat, local_skeleton)
+        global_mat = _mat_forward_kinematics(local_mat, self.smpl_parents.tolist())
+        joints = _mat_get_position(global_mat)
+        if get_intermediate:
+            return joints, local_mat, global_mat
+        return joints
+
+    def _pp_static_joint(
+        self,
+        pred_smpl_params_global: dict,
+        static_conf_logits: torch.Tensor,
+        sigma: float = 3.0,
+    ) -> torch.Tensor:
+        """Original GVHMR stage-1 post-process (pp_static_joint)."""
+        pred_w_j3d = self._smpl_fk(**pred_smpl_params_global)  # (B, L, 22, 3)
+        B, L = pred_w_j3d.shape[:2]
+        joint_ids = self.static_joint_ids
+        pred_j3d_static = pred_w_j3d[:, :, joint_ids]
+        pred_j_disp = pred_j3d_static[:, 1:] - pred_j3d_static[:, :-1]  # (B, L-1, 6, 3)
+
+        static_conf_logits = static_conf_logits[:, :-1].clone()
+        static_label = static_conf_logits > 0
+        static_conf_logits = static_conf_logits.float() - (~static_label).float() * 1e6
+        is_static = static_label.sum(dim=-1) > 0
+
+        pred_disp = pred_j_disp * static_conf_logits[..., None].softmax(dim=-2)
+        pred_disp = pred_disp * is_static[..., None, None]
+        pred_disp = pred_disp.sum(dim=-2)  # (B, L-1, 3)
+
+        pred_w_transl = pred_smpl_params_global["transl"].clone()
+        pred_w_disp = pred_w_transl[:, 1:] - pred_w_transl[:, :-1]
+        pred_w_disp_new = pred_w_disp - pred_disp
+        post_w_transl = torch.cumsum(
+            torch.cat([pred_w_transl[:, :1], pred_w_disp_new], dim=1), dim=1
+        )
+        post_w_transl[..., 0] = gaussian_smooth(post_w_transl[..., 0], sigma=sigma, dim=-1)
+        post_w_transl[..., 2] = gaussian_smooth(post_w_transl[..., 2], sigma=sigma, dim=-1)
+
+        post_w_j3d = pred_w_j3d - pred_w_transl.unsqueeze(-2) + post_w_transl.unsqueeze(-2)
+        ground_y = post_w_j3d[..., 1].reshape(B, -1).min(dim=-1)[0]
+        post_w_transl[..., 1] -= ground_y[:, None]
+        return post_w_transl
+
+    def _process_ik(self, pred_smpl_params_global: dict, static_conf_logits: torch.Tensor) -> torch.Tensor:
+        """Original GVHMR stage-2 post-process (stationary rollout + CCD IK)."""
+        static_conf = static_conf_logits.sigmoid()  # (B, L, 6)
+        post_w_j3d, local_mat, post_w_mat = self._smpl_fk(
+            **pred_smpl_params_global, get_intermediate=True
+        )
+
+        joint_ids = self.static_joint_ids
+        post_target_j3d = post_w_j3d.clone()
+        for i in range(1, post_w_j3d.size(1)):
+            prev = post_target_j3d[:, i - 1, joint_ids]
+            this = post_w_j3d[:, i, joint_ids]
+            c_prev = static_conf[:, i - 1, :, None]
+            post_target_j3d[:, i, joint_ids] = prev * c_prev + this * (1 - c_prev)
+
+        global_rot = _mat_get_rotation(post_w_mat)
+        parents = self.smpl_parents.tolist()
+        left_leg_chain = [0, 1, 4, 7, 10]
+        right_leg_chain = [0, 2, 5, 8, 11]
+        left_hand_chain = [9, 13, 16, 18, 20]
+        right_hand_chain = [9, 14, 17, 19, 21]
+
+        def ik(local_mat_, target_pos, target_rot, target_ind, chain):
+            local_mat_ = local_mat_.clone()
+            solver = _CCDIK(
+                local_mat_,
+                parents,
+                target_ind,
+                target_pos,
+                target_rot,
+                kinematic_chain=chain,
+                max_iter=2,
+            )
+            chain_local_mat = solver.solve()
+            chain_rotmat = _mat_get_rotation(chain_local_mat)
+            local_mat_[:, :, chain[1:], :3, :3] = chain_rotmat[:, :, 1:]
+            return local_mat_
+
+        local_mat = ik(local_mat, post_target_j3d[:, :, [7, 10]], global_rot[:, :, [7, 10]], [3, 4], left_leg_chain)
+        local_mat = ik(local_mat, post_target_j3d[:, :, [8, 11]], global_rot[:, :, [8, 11]], [3, 4], right_leg_chain)
+        local_mat = ik(local_mat, post_target_j3d[:, :, [20]], global_rot[:, :, [20]], [4], left_hand_chain)
+        local_mat = ik(local_mat, post_target_j3d[:, :, [21]], global_rot[:, :, [21]], [4], right_hand_chain)
+
+        body_pose = matrix_to_axis_angle(_mat_get_rotation(local_mat[:, :, 1:]))
+        return body_pose.flatten(2)
+
     @torch.no_grad()
     def forward(
         self,
@@ -1125,7 +1449,6 @@ class GVHMRModel(nn.Module):
         K_fullimg: torch.Tensor,
         length: torch.Tensor = None,
         transl_0: torch.Tensor = None,
-        foot_contact_threshold: float = None,
     ) -> dict:
         """Full GVHMR inference for one person track.
 
@@ -1142,16 +1465,12 @@ class GVHMRModel(nn.Module):
             transl_0:               (B, 1, 3) world-space position of the first
                                     frame (carry-over anchor for rolling window).
                                     None → start at origin.
-            foot_contact_threshold: sigmoid probability above which a frame is
-                                    treated as foot-in-contact and its horizontal
-                                    root velocity is zeroed before integration.
-                                    None → no foot contact constraint applied.
 
         Returns:
             dict with:
                 smpl_params_incam:  body_pose, betas, global_orient, transl (camera frame)
                 smpl_params_global: body_pose, betas, global_orient, transl (world frame)
-                static_conf_logits: (B, L, 6) raw foot contact logits
+                static_conf_logits: (B, L, 6) raw static-joint logits
         """
         B, L = obs.shape[:2]
         if length is None:
@@ -1187,14 +1506,9 @@ class GVHMRModel(nn.Module):
             "transl": transl_incam,
         }
 
-        # Optionally apply foot-contact constraint before velocity integration
+        # Keep the raw decoded velocity rollout, then apply the original
+        # GVHMR post-process in world space (pp_static_joint + process_ik).
         local_transl_vel = decode["local_transl_vel"]
-        if foot_contact_threshold is not None:
-            local_transl_vel = apply_foot_contact_constraints(
-                local_transl_vel,
-                out["static_conf_logits"],
-                conf_threshold=foot_contact_threshold,
-            )
 
         # Global (world) params — transl_0 carries the anchor across window slides
         global_rt = get_smpl_params_global(
@@ -1209,6 +1523,13 @@ class GVHMRModel(nn.Module):
             "betas": decode["betas"],
             **global_rt,
         }
+        if out["static_conf_logits"] is not None:
+            smpl_params_global["transl"] = self._pp_static_joint(
+                smpl_params_global, out["static_conf_logits"]
+            )
+            smpl_params_global["body_pose"] = self._process_ik(
+                smpl_params_global, out["static_conf_logits"]
+            )
 
         return {
             "smpl_params_incam": smpl_params_incam,

@@ -20,6 +20,7 @@ dependencies = [
   "matplotlib",
   # GMR retargeting (installed as editable from local path)
   "general-motion-retargeting",
+  "qpsolvers[daqp,open-source-solvers]>=4.11.0",
 ]
 
 [tool.uv]
