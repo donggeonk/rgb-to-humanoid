@@ -366,12 +366,16 @@ def _mat_get_TRS(rot_mat: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
     return mat
 
 
-def _mat_forward_kinematics(local_mat: torch.Tensor, parents: list[int]) -> torch.Tensor:
+def _mat_forward_kinematics(
+    local_mat: torch.Tensor, parents: list[int]
+) -> torch.Tensor:
     global_mat = local_mat.clone()
     for j, parent in enumerate(parents):
         if parent == -1:
             continue
-        global_mat[..., j, :, :] = global_mat[..., parent, :, :] @ global_mat[..., j, :, :]
+        global_mat[..., j, :, :] = (
+            global_mat[..., parent, :, :] @ global_mat[..., j, :, :]
+        )
     return global_mat
 
 
@@ -464,7 +468,12 @@ def _qslerp(q0: torch.Tensor, q1: torch.Tensor, t) -> torch.Tensor:
 
 def _qbetween(v0: torch.Tensor, v1: torch.Tensor) -> torch.Tensor:
     v = torch.cross(v0, v1, dim=-1)
-    w = torch.sqrt((v0.square().sum(dim=-1, keepdim=True) * v1.square().sum(dim=-1, keepdim=True)).clamp(min=1e-8))
+    w = torch.sqrt(
+        (
+            v0.square().sum(dim=-1, keepdim=True)
+            * v1.square().sum(dim=-1, keepdim=True)
+        ).clamp(min=1e-8)
+    )
     w = w + (v0 * v1).sum(dim=-1, keepdim=True)
     y_vec = torch.zeros_like(v)
     y_vec[..., 1] = 1.0
@@ -502,7 +511,9 @@ class _CCDIK:
 
         self.target_ind = target_ind
         self.target_pos = target_pos
-        self.target_q = _matrix_to_quaternion(target_rot) if target_rot is not None else None
+        self.target_q = (
+            _matrix_to_quaternion(target_rot) if target_rot is not None else None
+        )
 
         self.threshold = threshold
         self.J_N = self.local_mat.shape[-3]
@@ -524,7 +535,9 @@ class _CCDIK:
         rot = _mat_get_rotation(self.global_mat)[..., i, :, :]
         quat = _matrix_to_quaternion(rot)
 
-        x_vec = torch.zeros(quat.shape[:-1] + (3,), device=quat.device, dtype=quat.dtype)
+        x_vec = torch.zeros(
+            quat.shape[:-1] + (3,), device=quat.device, dtype=quat.dtype
+        )
         x_vec[..., 0] = 1.0
         y_vec = torch.zeros_like(x_vec)
         y_vec[..., 1] = 1.0
@@ -552,7 +565,11 @@ class _CCDIK:
                 if self.pos_weight > 0:
                     count += 1
 
-            if self.target_q is not None and target_i == self.target_N - 1 and self.rot_weight > 0:
+            if (
+                self.target_q is not None
+                and target_i == self.target_N - 1
+                and self.rot_weight > 0
+            ):
                 target_q = self.target_q[..., target_i, :]
                 solved_rot_target_quat = _qslerp(
                     quat,
@@ -1334,7 +1351,9 @@ class GVHMRModel(nn.Module):
         """Lightweight SMPL FK on the neutral 22-joint skeleton asset."""
         B, L = body_pose.shape[:2]
         if global_orient is None:
-            global_orient = torch.zeros((B, L, 3), device=body_pose.device, dtype=body_pose.dtype)
+            global_orient = torch.zeros(
+                (B, L, 3), device=body_pose.device, dtype=body_pose.dtype
+            )
 
         aa = torch.cat([global_orient, body_pose], dim=-1).reshape(B, L, 22, 3)
         rotmat = axis_angle_to_matrix(aa)  # (B, L, 22, 3, 3)
@@ -1370,7 +1389,7 @@ class GVHMRModel(nn.Module):
         pred_j_disp = pred_j3d_static[:, 1:] - pred_j3d_static[:, :-1]  # (B, L-1, 6, 3)
 
         static_conf_logits = static_conf_logits[:, :-1].clone()
-        static_label = static_conf_logits > 0
+        static_label = static_conf_logits > -0.5
         static_conf_logits = static_conf_logits.float() - (~static_label).float() * 1e6
         is_static = static_label.sum(dim=-1) > 0
 
@@ -1384,17 +1403,25 @@ class GVHMRModel(nn.Module):
         post_w_transl = torch.cumsum(
             torch.cat([pred_w_transl[:, :1], pred_w_disp_new], dim=1), dim=1
         )
-        post_w_transl[..., 0] = gaussian_smooth(post_w_transl[..., 0], sigma=sigma, dim=-1)
-        post_w_transl[..., 2] = gaussian_smooth(post_w_transl[..., 2], sigma=sigma, dim=-1)
+        post_w_transl[..., 0] = gaussian_smooth(
+            post_w_transl[..., 0], sigma=sigma, dim=-1
+        )
+        post_w_transl[..., 2] = gaussian_smooth(
+            post_w_transl[..., 2], sigma=sigma, dim=-1
+        )
 
-        post_w_j3d = pred_w_j3d - pred_w_transl.unsqueeze(-2) + post_w_transl.unsqueeze(-2)
+        post_w_j3d = (
+            pred_w_j3d - pred_w_transl.unsqueeze(-2) + post_w_transl.unsqueeze(-2)
+        )
         ground_y = post_w_j3d[..., 1].reshape(B, -1).min(dim=-1)[0]
         post_w_transl[..., 1] -= ground_y[:, None]
         return post_w_transl
 
-    def _process_ik(self, pred_smpl_params_global: dict, static_conf_logits: torch.Tensor) -> torch.Tensor:
+    def _process_ik(
+        self, pred_smpl_params_global: dict, static_conf_logits: torch.Tensor
+    ) -> torch.Tensor:
         """Original GVHMR stage-2 post-process (stationary rollout + CCD IK)."""
-        static_conf = static_conf_logits.sigmoid()  # (B, L, 6)
+        static_conf = (static_conf_logits * 2).sigmoid()  # (B, L, 6)
         post_w_j3d, local_mat, post_w_mat = self._smpl_fk(
             **pred_smpl_params_global, get_intermediate=True
         )
@@ -1423,17 +1450,41 @@ class GVHMRModel(nn.Module):
                 target_pos,
                 target_rot,
                 kinematic_chain=chain,
-                max_iter=2,
+                max_iter=4,
             )
             chain_local_mat = solver.solve()
             chain_rotmat = _mat_get_rotation(chain_local_mat)
             local_mat_[:, :, chain[1:], :3, :3] = chain_rotmat[:, :, 1:]
             return local_mat_
 
-        local_mat = ik(local_mat, post_target_j3d[:, :, [7, 10]], global_rot[:, :, [7, 10]], [3, 4], left_leg_chain)
-        local_mat = ik(local_mat, post_target_j3d[:, :, [8, 11]], global_rot[:, :, [8, 11]], [3, 4], right_leg_chain)
-        local_mat = ik(local_mat, post_target_j3d[:, :, [20]], global_rot[:, :, [20]], [4], left_hand_chain)
-        local_mat = ik(local_mat, post_target_j3d[:, :, [21]], global_rot[:, :, [21]], [4], right_hand_chain)
+        local_mat = ik(
+            local_mat,
+            post_target_j3d[:, :, [7, 10]],
+            global_rot[:, :, [7, 10]],
+            [3, 4],
+            left_leg_chain,
+        )
+        local_mat = ik(
+            local_mat,
+            post_target_j3d[:, :, [8, 11]],
+            global_rot[:, :, [8, 11]],
+            [3, 4],
+            right_leg_chain,
+        )
+        local_mat = ik(
+            local_mat,
+            post_target_j3d[:, :, [20]],
+            global_rot[:, :, [20]],
+            [4],
+            left_hand_chain,
+        )
+        local_mat = ik(
+            local_mat,
+            post_target_j3d[:, :, [21]],
+            global_rot[:, :, [21]],
+            [4],
+            right_hand_chain,
+        )
 
         body_pose = matrix_to_axis_angle(_mat_get_rotation(local_mat[:, :, 1:]))
         return body_pose.flatten(2)
