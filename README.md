@@ -8,14 +8,14 @@
   <sub>Left to right: input video · GVHMR SMPL-X estimate · GMR retargeting to Unitree G1 · One Euro smoothing</sub>
 </p>
 
-The pipeline chains three stages:
+The pipeline chains three stages, then packages the result for a whole-body controller:
 
 ```
- RGB video ──▶ GVHMR pose estimation ──▶ GMR retargeting ──▶ One Euro filter ──▶ robot joint trajectories
- (any camera)    (SMPL-X, world frame)    (Unitree G1 qpos)    (jitter removal)     (.pkl, 30 fps)
+ RGB video ──▶ GVHMR pose estimation ──▶ GMR retargeting ──▶ One Euro filter ──▶ SONIC reference stream
+ (any camera)    (SMPL-X, world frame)    (Unitree G1 qpos)    (jitter removal)    (joint pos/vel + root quat, 50 Hz, ZMQ)
 ```
 
-It runs offline on a video file or live from a webcam, where every frame is detected, lifted to 3D, retargeted, and rendered on the robot in MuJoCo in one loop.
+It runs offline on a video file or live from a webcam, where every frame is detected, lifted to 3D, retargeted, and rendered on the robot in MuJoCo in one loop. The final stage converts the trajectory into the reference format of NVIDIA's [GEAR-SONIC](https://github.com/NVlabs/GR00T-WholeBodyControl) tracking policy and streams it over ZMQ, so the motion can drive a physics-controlled G1 rather than a kinematic replay.
 
 ## Stages
 
@@ -40,6 +40,7 @@ It runs offline on a video file or live from a webcam, where every frame is dete
 | Temporal smoothing | Gaussian smoothing on SO(3) (rotation matrices + SVD projection) instead of on raw axis-angle, plus axis-angle continuity fixes to remove ±π flips | `gvhmr_model.py` |
 | Retargeting | SMPL-X joints → Unitree G1 joint angles with GMR's IK, straight from this repo's `.npz` output | GMR `scripts/smplx_to_robot.py` |
 | Jitter removal | Speed-adaptive One Euro filter on the robot joint trajectory; causal, so it also works live | `smooth_robot_motion.py` |
+| Controller hand-off | Resample to 50 Hz, derive joint velocities, pack SONIC protocol v1 frames, validate and publish over ZMQ | `sonic/` |
 
 ## What is in this repo
 
@@ -55,6 +56,7 @@ It runs offline on a video file or live from a webcam, where every frame is dete
 | `smooth_robot_motion.py` | ~200 | One Euro filter over GMR robot motion, with a before/after jitter report and optional video render |
 | `export_smpl_skeleton.py` | ~60 | One-time export of the SMPL neutral skeleton (`smpl_neutral_skeleton.npz`) that the FK uses |
 | `GMR/` | submodule | [GMR](https://github.com/YanjieZe/GMR), pinned and installed as an editable dependency |
+| `sonic/` | ~400 | GEAR-SONIC integration: GMR-to-SONIC converter, bundle validator, protocol v1 packer and ZMQ publisher (numpy + pyzmq only) |
 
 Engineering details worth knowing:
 
@@ -117,6 +119,19 @@ uv run python smooth_robot_motion.py --input ../GMR/motions/tennis_g1.pkl \
 
 `--joints` takes `all`, `legs`, or comma-separated joint-name substrings; `--min_cutoff` and `--beta` tune the filter. The script prints the jitter score before and after.
 
+### 4. Package for SONIC
+
+```bash
+cd ../sonic
+pip install -r requirements.txt     # numpy, pyzmq
+python gmr_to_sonic.py --input ../GMR/motions/tennis_g1_smoothed.pkl \
+    --output outputs/tennis/sonic_stream_v1.npz
+python run_sonic_from_output.py --input outputs/tennis --dry-run        # validate + print frames
+python run_sonic_from_output.py --input outputs/tennis --publish --port 5556 --topic pose
+```
+
+The bundle holds `joint_pos`, `joint_vel` (29 G1 joints at 50 Hz), `body_quat` (wxyz) and `frame_index`, plus the joint-name order for checking against your deployment. The publisher packs each frame into SONIC's protocol v1 binary layout and streams it on a ZMQ PUB socket at the bundle's frame rate. This is an integration, not a verified demo: the SONIC policy itself runs through GR00T-WholeBodyControl on an Ubuntu machine with an NVIDIA GPU, and we have not yet closed the loop on hardware.
+
 ### Live webcam → robot
 
 ```bash
@@ -131,4 +146,4 @@ Opens the camera, runs the full pipeline per frame, and drives the G1 in GMR's M
 
 ## Acknowledgements
 
-Built on [GVHMR](https://github.com/zju3dv/GVHMR) (Shen et al., SIGGRAPH Asia 2024), [GMR](https://github.com/YanjieZe/GMR) (Ze et al., 2025), [HMR2.0 / 4D-Humans](https://github.com/shubham-goel/4D-Humans), [ViTPose](https://github.com/ViTAE-Transformer/ViTPose), [Ultralytics YOLO](https://github.com/ultralytics/ultralytics) and the [One Euro filter](https://gery.casiez.net/1euro/) (Casiez et al., CHI 2012). Model weights follow their original licenses.
+Built on [GVHMR](https://github.com/zju3dv/GVHMR) (Shen et al., SIGGRAPH Asia 2024), [GMR](https://github.com/YanjieZe/GMR) (Ze et al., 2025), [HMR2.0 / 4D-Humans](https://github.com/shubham-goel/4D-Humans), [ViTPose](https://github.com/ViTAE-Transformer/ViTPose), [Ultralytics YOLO](https://github.com/ultralytics/ultralytics), the [One Euro filter](https://gery.casiez.net/1euro/) (Casiez et al., CHI 2012) and [GEAR-SONIC](https://github.com/NVlabs/GR00T-WholeBodyControl) (NVIDIA, 2025). Model weights follow their original licenses.
